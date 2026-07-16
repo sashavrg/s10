@@ -1,0 +1,21 @@
+# Topic curation rules
+# Edit this file to control how topics are organized.
+#
+# aliases:   map noisy slugs to a canonical slug
+# ignored:   drop these topics entirely
+# manual_topics: force a source_id onto specific topics
+# pinned:    preferred display name for a canonical slug
+
+aliases:
+  # example: noisy-slug: canonical-slug
+
+ignored:
+  - none
+
+manual_topics: {}
+  # example-source-id:
+  #   - topic-slug-1
+  #   - topic-slug-2
+
+pinned: {}
+  # example-topic-slug: Example Topic Display Name

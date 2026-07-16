@@ -1,0 +1,30 @@
+# Golden retrieval cases — EXAMPLE SET (fully synthetic).
+# Copy this file to evals/cases.jsonl and replace these cases with your own, drawn from
+# your real prompts and the topic slugs your KB actually produces (see `kb.py list-topics`).
+# One JSON object per line; lines starting with # are ignored.
+#
+# Fields:
+#   id       stable unique string — the split assignment and A/B compare are keyed on it
+#   kind     "direct"     = prompt shares vocabulary with the expected topic
+#            "paraphrase" = same intent, deliberately different wording (the hard case)
+#            "negative"   = prompt that should trigger NO high-tier injection (expect: [])
+#   project  session project tag used to scope retrieval (or null for unscoped prompts)
+#   prompt   the user-prompt text fed to memory_index.retrieve()
+#   expect   list of topic slugs that SHOULD be retrieved (empty list for negatives)
+#   split    "train" | "val" | "held_out" — may be omitted; run scripts/eval_split.py
+#            to assign splits deterministically (60/20/20, stratified by kind).
+#            held_out is reserved: never tune against it.
+#
+# Run:  python evals/run_eval.py run --cases evals/cases.jsonl --label lexical
+{"id": "acme-widget-regen-direct", "kind": "direct", "project": "acme-portal-api", "prompt": "How do I regenerate the embed widget for a client after their config changes?", "expect": ["widget-embed-regeneration"], "split": "train"}
+{"id": "acme-widget-regen-para", "kind": "paraphrase", "project": "acme-portal-api", "prompt": "A customer updated their settings and their on-site component still shows stale data — what is the refresh procedure?", "expect": ["widget-embed-regeneration"], "split": "train"}
+{"id": "acme-deploy-direct", "kind": "direct", "project": "acme-portal-api", "prompt": "Walk me through the deploy pipeline configuration for acme-portal-api.", "expect": ["deploy-pipeline-configuration"], "split": "train"}
+{"id": "acme-deploy-para", "kind": "paraphrase", "project": "acme-portal-api", "prompt": "What is the safe way to ship a portal API release to production?", "expect": ["deploy-pipeline-configuration"], "split": "val"}
+{"id": "acme-microsite-direct", "kind": "direct", "project": "acme-portal-api", "prompt": "How do per-brand overrides work in the microsite configuration system?", "expect": ["microsite-configuration-system"], "split": "val"}
+{"id": "acme-ratelimit-para", "kind": "paraphrase", "project": "acme-portal-api", "prompt": "Client integrations keep hitting 429s on our endpoints — what did we decide about throttling?", "expect": ["api-rate-limiting"], "split": "train"}
+{"id": "acme-neg-python", "kind": "negative", "project": "acme-portal-api", "prompt": "What is the syntax for a Python f-string containing a nested quote?", "expect": [], "split": "train"}
+{"id": "acme-neg-smalltalk", "kind": "negative", "project": "acme-portal-api", "prompt": "Write a short changelog entry announcing the spring release.", "expect": [], "split": "val"}
+{"id": "homelab-backup-direct", "kind": "direct", "project": "homelab", "prompt": "What do the nightly backup health checks on the home server verify?", "expect": ["backup-health-checks"], "split": "train"}
+{"id": "homelab-logs-para", "kind": "paraphrase", "project": "homelab", "prompt": "Where do all the container logs on my server end up, and how do I search them?", "expect": ["log-aggregation"], "split": "held_out"}
+{"id": "homelab-neg-recipe", "kind": "negative", "project": "homelab", "prompt": "Suggest a weeknight pasta recipe that takes under thirty minutes.", "expect": [], "split": "held_out"}
+{"id": "acme-widget-regen-held", "kind": "direct", "project": "acme-portal-api", "prompt": "Which script regenerates client widgets and what configuration does it read?", "expect": ["widget-embed-regeneration", "deploy-pipeline-configuration"], "split": "held_out"}

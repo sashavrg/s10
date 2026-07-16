@@ -1,0 +1,29 @@
+Create a concise Markdown review dashboard for a local knowledge base.
+
+Input includes:
+- source records
+- topic records
+- collected open questions
+
+Produce exactly these sections:
+# Review dashboard
+
+## Newly compiled sources
+- bullets only
+
+## Topics needing attention
+- bullets only
+
+## Open questions
+- bullets only
+
+## Suggested next actions
+1. numbered list only
+
+Rules:
+- Output Markdown only.
+- Do not output JSON.
+- Do not output code fences.
+- Do not write Python, pseudocode, or explanations about the task.
+- Do not restate the prompt.
+- Keep it short and factual.

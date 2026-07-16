@@ -1,0 +1,40 @@
+# config/memory_tuning.yaml — tunable knobs for the memory-injection hook.
+# Read at runtime by scripts/memory_index.py (stdlib parser, no PyYAML).
+# Auto-tune (scripts/audit_hooks.py) may only TIGHTEN these on a dated branch:
+# raise thresholds, append to high_ineligible. Loosening = human only.
+
+thresholds:
+  high: 0.73            # >= -> HIGH tier (injects)
+  moderate: 0.4         # >= -> MODERATE (logged, suppressed)
+
+# Slugs that may never reach HIGH (catch-alls / proven false-firers).
+high_ineligible:
+  - acme                # example seed: block your employer/project mega-topics
+  - monitoring-setup
+  - acme-portal-api     # project-name mega-topic catch-all; 2 distinctive tokens slip the bare-token rule
+
+# REVERSIBLE demotions from real-traffic outcomes. The nightly auditor REWRITES
+# this list wholesale each run (scripts/audit_hooks.py): a slug appears while it has
+# >= min_samples HIGH injects in the window with 0 useful ones, and leaves on its own
+# once those misfires age out — so it is NOT a one-way latch (unlike high_ineligible).
+# Do not hand-curate; put permanent catch-alls in high_ineligible above instead.
+outcome_demoted:
+
+# A distinctive single-token slug equal to one of these is auto-demoted below
+# HIGH (a bare project-name slug behaves as a catch-all). Keep roughly in sync
+# with the projects in config/source_projects.yaml.
+project_catch_all_tokens:
+  - acme
+  - dashboard
+  - llm-kb
+  - acme-sustainability-form-backend
+  - stable-diffusion-webui-docker
+
+auto_tune:
+  enabled: true
+  window_days: 14
+  min_samples: 3
+  cross_project_min: 3
+  threshold_step: 0.01
+  threshold_ceiling: 0.85
+  false_high_rate_trigger: 0.3

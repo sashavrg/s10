@@ -1,0 +1,82 @@
+# =============================================================================
+#  §10 (s10) — DATA vs MACHINERY boundary (default-deny)
+# =============================================================================
+#  This repo ingests personal notes, repo snapshots and PDFs that routinely
+#  contain secrets (DB creds, tokens, bastion access). To make a leak
+#  structurally hard, tracking is DEFAULT-DENY:
+#
+#    * MACHINERY  — the system itself (code, tests, prompts, config TEMPLATES,
+#      docs, the eval harness). Tracked. Allow-listed by name below.
+#    * DATA       — anything the system reads or produces (raw/ compiled/ state/
+#      logs/ review/ eval results, the real config, the .env, samples). NEVER
+#      tracked. Any NEW top-level entry is ignored by default, so a future data
+#      dir (cache/, inbox/, embeddings/…) can't silently get committed.
+#
+#  To track a NEW machinery path you must consciously add a `!` line here. That
+#  deliberate step is the safeguard. When in doubt: it's data — leave it out.
+#
+#  NOTE: .gitignore keeps DATA out of git. It does NOT stop a secret pasted into
+#  a tracked machinery file (docs!) — that's what the pre-commit secret scan
+#  (scripts/scan_secrets.py via hooks/) is for. Install: git config core.hooksPath hooks
+# -----------------------------------------------------------------------------
+
+# 1) Default-deny: ignore every top-level entry...
+/*
+
+# 2) ...then re-include MACHINERY only.
+#    Root files:
+!/.gitignore
+!/README.md
+!/CLAUDE.md
+!/LICENSE
+!/requirements.txt
+!/requirements-dev.txt
+
+#    Machinery directories (their contents are tracked):
+!/scripts/
+!/tests/
+!/prompts/
+!/config/
+!/docs/
+!/evals/
+!/hooks/
+
+# 3) Carve DATA back out of otherwise-tracked machinery dirs.
+#    Eval *results* are regenerated data; only the harness + golden cases ship.
+/evals/results/
+#    Eval *candidates* are raw captured transcripts (may carry client data) staged
+#    for triage; they stay local-only.
+/evals/candidates/
+#    Your real golden cases are data (they quote your own sessions); ship
+#    evals/cases.example.jsonl instead and copy it to cases.jsonl locally.
+/evals/cases.jsonl
+#    Real curation/project config is data; ship the .example templates instead.
+/config/topics.yaml
+/config/source_projects.yaml
+#    Hook-tuning observation logs are data (they quote your own prompts/sessions);
+#    only the README/template ships. auto-audit.md is written by the nightly
+#    audit_hooks.py, the other two by hand as misfires are observed.
+/docs/hook-tuning/auto-audit.md
+/docs/hook-tuning/memory-injection.md
+/docs/hook-tuning/correction-capture.md
+
+# 4) Belt-and-suspenders: name the known data + secret paths explicitly, so the
+#    intent stays documented even if the default-deny block above is ever loosened.
+/.env
+/raw/
+/compiled/
+/review/
+/state/
+/logs/
+/sample.pdf
+/sample_local_llm_note.md
+/.hermes/
+
+# 5) Tooling / OS noise (also covered by default-deny; kept for clarity)
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+.DS_Store
+Thumbs.db

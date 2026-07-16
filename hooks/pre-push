@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# llm-kb pre-push — last line of defense before code leaves the machine:
+#   1. secret scan over the whole tracked tree (backstop for anything that was
+#      committed with --no-verify or before the pre-commit hook was installed),
+#   2. the test suite.
+#
+# Activated via `git config core.hooksPath hooks` (see hooks/pre-commit).
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+PY="python3"
+if [ -f .venv/bin/activate ]; then
+  # shellcheck source=/dev/null
+  source .venv/bin/activate
+  PY="python"
+fi
+
+echo "pre-push: scanning tracked files for secrets..."
+"$PY" scripts/scan_secrets.py
+
+if ! command -v pytest >/dev/null 2>&1; then
+  echo "pre-push: pytest not installed; skipping tests (run: pip install -r requirements-dev.txt)"
+  exit 0
+fi
+
+echo "pre-push: running pytest..."
+pytest tests/ -q

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# llm-kb pre-commit — block secrets from entering tracked (machinery) files.
+#
+# The data/machinery .gitignore keeps personal KB *data* out of git, but it
+# cannot stop a secret pasted into a tracked machinery file (docs are *supposed*
+# to be tracked — and that is exactly where the last leak lived). This hook
+# scans the staged content for credentials before the commit is created.
+#
+# Install once per clone (hooks are not auto-activated):
+#   git config core.hooksPath hooks
+#
+# Bypass for a single commit (use sparingly): git commit --no-verify
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PY="python3"
+[ -x "$REPO_ROOT/.venv/bin/python" ] && PY="$REPO_ROOT/.venv/bin/python"
+
+if ! "$PY" "$REPO_ROOT/scripts/scan_secrets.py" --staged; then
+  echo "pre-commit: BLOCKED — staged changes contain a possible secret (see above)." >&2
+  exit 1
+fi

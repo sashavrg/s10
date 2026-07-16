@@ -1,0 +1,18 @@
+# Source -> project map for memory-retrieval scoping.
+# Copy to config/source_projects.yaml and maintain it by hand (or seed it with a
+# one-time LLM classification of your KB sources).
+#
+# Only NON-global sources are listed. Any source_id absent here is treated as
+# 'global' (its facts surface in every project's sessions).
+# `python scripts/kb.py apply-projects` writes these onto state/manifest.json
+# (run_pipeline applies them automatically each run); memory_index reads the
+# manifest. Edit here -> re-run apply-projects to take effect.
+#
+# Project names are yours to choose; keep them short and stable — they must
+# match the project detection used by the memory-injection hook.
+
+projects:
+  file-20260404-171201-phase-1-notes: s10
+  inbox-20260406-125346-acme-portal-api-4-week-review: acme-portal-api
+  inbox-20260406-130347-config-yaml-reference: acme-portal-api
+  inbox-20260512-091502-homelab-backup-runbook: homelab
