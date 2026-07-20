@@ -27,12 +27,13 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 INJECTION_LOG_PATH = BASE_DIR / 'logs' / 'memory_injection.jsonl'
 OUTCOME_V1_PATH = BASE_DIR / 'logs' / 'injection_outcomes.jsonl'
 RESCORED_PATH = BASE_DIR / 'logs' / 'injection_outcomes_rescored.jsonl'
-TRANSCRIPT_ROOT = Path.home() / '.claude' / 'projects'
 
 
-def find_transcript(session_id: str, root: Path = TRANSCRIPT_ROOT) -> Path | None:
-    hits = sorted(root.glob(f'*/{session_id}.jsonl'))
-    return hits[0] if hits else None
+def find_transcript(session_id: str) -> Path | None:
+    """Live projects dir first, then the retention-proof archive (ej9 gate
+    addendum A5.3): an archived transcript keeps rescoring after Claude
+    Code's retention cleanup expires the live copy."""
+    return ej.resolve_transcript(session_id)
 
 
 def group_sessions(rows: list[dict]) -> tuple[dict[str, list[dict]], int]:

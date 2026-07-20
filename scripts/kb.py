@@ -557,8 +557,9 @@ def classify_cloud_error(text: str) -> str:
     return 'other'
 
 
-def claude_code_generate(model: str, prompt: str) -> str:
-    """Run one headless Claude Code completion under the subscription login.
+def claude_code_payload(model: str, prompt: str) -> dict:
+    """Run one headless Claude Code completion and return the FULL parsed CLI
+    payload (the gate-read runner asserts its `modelUsage` — ej9 addendum A1).
 
     Pipes the prompt via stdin, runs from a neutral cwd so the call does not
     auto-load this repo's CLAUDE.md/skills, and scrubs ANTHROPIC_API_KEY so the
@@ -594,11 +595,16 @@ def claude_code_generate(model: str, prompt: str) -> str:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
         raise CloudLLMError('other', 'could not parse claude JSON output') from e
-    result = (payload.get('result') or '').strip()
     if payload.get('is_error'):
         # Structured error payload: claude embeds the human-readable error text
         # in the payload fields, so classify from the serialized payload.
         raise CloudLLMError(classify_cloud_error(json.dumps(payload)), 'claude returned is_error=true')
+    return payload
+
+
+def claude_code_generate(model: str, prompt: str) -> str:
+    """One headless completion's result text (thin claude_code_payload wrapper)."""
+    result = (claude_code_payload(model, prompt).get('result') or '').strip()
     if not result:
         raise CloudLLMError('other', 'empty result from claude')
     return result

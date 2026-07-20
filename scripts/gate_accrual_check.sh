@@ -62,7 +62,7 @@ fi
 
 echo "[gate-accrual] fresh HIGH rows: $COUNT / $TARGET"
 if [ "$COUNT" -ge "$TARGET" ] && [ ! -f "$MARKER" ]; then
-  notify "🎯 KB gate accrual TRIPPED — fresh HIGH rows: ${COUNT} >= ${TARGET}. The ej9 gate set is fully powered: ask Claude to generate the blind gate dossier."
+  notify "🎯 KB gate accrual TRIPPED — fresh HIGH rows: ${COUNT} >= ${TARGET}. The ej9 gate set is fully powered: run 'python scripts/gate_dossier.py make' (addendum A4) and start the blind labeling session."
   date -Iseconds > "$MARKER"
   echo "[gate-accrual] notified + marker written"
 fi

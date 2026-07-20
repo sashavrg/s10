@@ -23,6 +23,16 @@ VENV_PY="$KB_DIR/.venv/bin/python"
 PY="$VENV_PY"
 [ -x "$VENV_PY" ] || PY="python3"
 
+# Gate-set upkeep (ej9 gate addendum A5): archive transcripts before retention
+# deletes them, then refresh the rescored analysis file — judge pass pinned OFF
+# pre-gate. Runs here so the 09:05 gate-accrual check always counts fresh,
+# retention-proofed data. Logged, never fatal to the heartbeat.
+{
+  echo "[$(date -Iseconds)] gate-set upkeep"
+  "$KB_DIR/scripts/archive_transcripts.sh"
+  KB_JUDGE_MAX_CALLS=0 "$PY" "$KB_DIR/scripts/rescore_outcomes.py"
+} >> "$KB_DIR/logs/heartbeat.log" 2>&1 || true
+
 STATUS="$("$PY" - "$KB_DIR/state/sync_meta.json" "$MAX_AGE_HOURS" <<'PY'
 import json, sys, datetime as dt
 meta_path, max_age = sys.argv[1], float(sys.argv[2])
