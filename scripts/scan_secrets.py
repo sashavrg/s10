@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Commit-time secret gate for llm-kb.
+"""Commit-time secret gate for s10.
 
 The data/machinery split (see CLAUDE.md "Data vs machinery") keeps personal KB
 *data* out of git via .gitignore. But the leak that prompted this lived in

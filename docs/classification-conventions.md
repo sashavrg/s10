@@ -135,7 +135,7 @@ Recommended:
 - `dashboard-api`
 - `homeserver-infra`
 - `system-docs`
-- `llm-kb`
+- `s10`
 - `shared-team-docs`
 - `none`
 

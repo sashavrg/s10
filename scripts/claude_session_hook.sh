@@ -7,7 +7,7 @@
 #     "hooks": {
 #       "SessionEnd": [
 #         { "hooks": [ { "type": "command",
-#                        "command": "/ABS/PATH/llm-kb/scripts/claude_session_hook.sh" } ] }
+#                        "command": "/ABS/PATH/s10/scripts/claude_session_hook.sh" } ] }
 #       ]
 #     }
 #   }

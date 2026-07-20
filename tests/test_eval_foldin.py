@@ -84,9 +84,9 @@ def test_parse_hooktuning_traces_structured_only():
 def test_hooktuning_autofold_matches_row_and_respects_burn():
     traces = [{'ts': 'tA', 'injected': 'aws'}, {'ts': 'tB', 'injected': 'x'}]
     inj = [{'session_id': 'sA', 'ts': 'tA', 'tier': 'high', 'injected': 'aws',
-            'project': 'llm-kb', 'prompt_head': 'what aws the deploy status'},
+            'project': 's10', 'prompt_head': 'what aws the deploy status'},
            {'session_id': 'sB', 'ts': 'tB', 'tier': 'high', 'injected': 'x',
-            'project': 'llm-kb', 'prompt_head': 'p'}]
+            'project': 's10', 'prompt_head': 'p'}]
     auto, burned = ef.hooktuning_autofold(traces, inj, burn_keys={('sA', 'tA')})
     assert burned == 1
     assert len(auto) == 1 and auto[0]['expect'] == []

@@ -26,7 +26,7 @@ outcome_demoted:
 project_catch_all_tokens:
   - acme
   - dashboard
-  - llm-kb
+  - s10
   - acme-sustainability-form-backend
   - stable-diffusion-webui-docker
 

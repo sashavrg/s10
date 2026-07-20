@@ -36,13 +36,13 @@ def test_summarize_reports_held_out_split_separately():
 def test_summarize_stratifies_by_project_kind():
     rows = [
         _row('a', 'paraphrase', 'acme', 'train', ['s'], hit=True),
-        _row('b', 'negative', 'llm-kb', 'val', [], false_high=True),
+        _row('b', 'negative', 's10', 'val', [], false_high=True),
     ]
     s = run_eval.summarize(rows, k=5)
     assert 'acme·paraphrase' in s['by_project_kind']
-    assert 'llm-kb·negative' in s['by_project_kind']
+    assert 's10·negative' in s['by_project_kind']
     # negative cell carries the false-HIGH rate
-    assert s['by_project_kind']['llm-kb·negative']['false_high_on_negatives'] == '1/1 (100%)'
+    assert s['by_project_kind']['s10·negative']['false_high_on_negatives'] == '1/1 (100%)'
 
 
 def test_summarize_keeps_backward_compatible_overall_keys():

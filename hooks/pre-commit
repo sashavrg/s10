@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# llm-kb pre-commit — block secrets from entering tracked (machinery) files.
+# s10 pre-commit — block secrets from entering tracked (machinery) files.
 #
 # The data/machinery .gitignore keeps personal KB *data* out of git, but it
 # cannot stop a secret pasted into a tracked machinery file (docs are *supposed*

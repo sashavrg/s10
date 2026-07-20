@@ -2,7 +2,7 @@ Doc Type: rubric (normative)
 Status: SIGNED by operator 2026-07-03 (three edits applied; R7 dev relabels confirmed; R8 added 2026-07-03, operator-worded — judge version ej7)
 Audience: the engagement judge (quotes this verbatim) + labelers (humans use the same standard)
 Environment: cross-environment
-Scope: llm-kb engagement measurement
+Scope: s10 engagement measurement
 
 # Engagement Rubric — the operator's definition of "engaged"
 

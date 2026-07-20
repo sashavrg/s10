@@ -202,7 +202,7 @@ def read_frontmatter_doc(path: Path) -> tuple[dict[str, Any], str]:
 def fetch_article(url: str) -> tuple[str, str]:
     downloaded = trafilatura.fetch_url(url)
     if not downloaded:
-        response = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0 (compatible; llm-kb/0.1)'})
+        response = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0 (compatible; s10/0.1)'})
         response.raise_for_status()
         downloaded = response.text
     extracted = trafilatura.extract(downloaded, output_format='markdown', include_links=True, include_images=False, favor_precision=True)

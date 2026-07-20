@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# llm-kb pre-push — last line of defense before code leaves the machine:
+# s10 pre-push — last line of defense before code leaves the machine:
 #   1. secret scan over the whole tracked tree (backstop for anything that was
 #      committed with --no-verify or before the pre-commit hook was installed),
 #   2. the test suite.

@@ -14,7 +14,7 @@ export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 mkdir -p logs
 exec > >(tee -a logs/pipeline.log) 2>&1
 
-exec 9>/tmp/llm-kb-pipeline.lock
+exec 9>/tmp/s10-pipeline.lock
 if ! flock -n 9; then
   echo "[kb $(date -u +%Y-%m-%dT%H:%M:%SZ)] another pipeline run is in progress; exiting"
   exit 0

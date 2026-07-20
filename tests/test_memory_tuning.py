@@ -3,7 +3,7 @@ import memory_index as mi
 TUNING = {
     'thresholds': {'high': 0.72, 'moderate': 0.40},
     'high_ineligible': ['acme'],
-    'project_catch_all_tokens': ['acme', 'dashboard', 'llm-kb'],
+    'project_catch_all_tokens': ['acme', 'dashboard', 's10'],
 }
 
 
