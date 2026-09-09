@@ -140,6 +140,10 @@ Optional `.env` keys:
   sync with another machine (inbox pull + cache publish). Unset = fully local.
 - `KB_DASHBOARD_DIR` — sync against a local data dir instead (e.g. when the
   pipeline runs on the machine that also hosts your dashboard)
+- `KB_JUDGE_MAX_CALLS` — nightly cap on cloud (Sonnet) judge calls in the
+  heartbeat's outcome re-scoring pass; default `40`, `0` disables the pass
+- `KB_HARVEST_BACKFILL_CAP` — nightly cap on cloud calls spent harvesting
+  corrections from the pre-hook transcript backlog; default `60`
 
 ## Optional: the self-improvement feedback loop
 

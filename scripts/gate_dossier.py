@@ -10,6 +10,9 @@ the operator-signed addendum (docs/superpowers/specs/2026-07-20-ej9-gate-read-ad
           evals/candidates/. Prints aggregate counts ONLY, never row content.
 `parse` — read the operator's filled labels back, report incomplete rows by
           ordinal, and write the label rows jsonl for the gate read.
+`count` — the same selection, counts only (judgeable total on stdout, breakdown
+          on stderr, nothing written). This is what `gate_accrual_check.sh`
+          gates on: accrual must track the JUDGEABLE set, not raw fresh HIGH.
 
 BLINDNESS CONTRACT (test-pinned): the dossier must never contain any scorer or
 judge output — no `engaged_in_assistant`, `engaged_matched`, `judge_*`, no
@@ -24,7 +27,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 import engagement_judge as ej
@@ -38,7 +43,17 @@ INJECTION_LOG_PATH = BASE_DIR / 'logs' / 'memory_injection.jsonl'
 OUT_PATH = BASE_DIR / 'evals' / 'candidates' / 'ej9-gate-dossier.md'
 LABELS_PATH = BASE_DIR / 'evals' / 'candidates' / 'ej9-gate-labels.jsonl'
 
-TARGET = 35              # full-power gate threshold (KB_GATE_HIGH_TARGET default)
+def _target() -> int:
+    """Full-power gate threshold; KB_GATE_HIGH_TARGET overrides (the accrual
+    tripwire reads the same env var, so the two can never disagree)."""
+    try:
+        return int(os.environ.get('KB_GATE_HIGH_TARGET') or 35)
+    except ValueError:
+        return 35
+
+
+TARGET = _target()
+
 # Labeler-side evidence is deliberately FULLER than the judge's (300-char/8
 # snippets, 1400-char reply) — round-2 freeze record.
 SNIPPET_WIDTH = 600
@@ -227,12 +242,27 @@ def gate_verdict(p: float, r: float, stage: int = 1) -> str:
     return 'expand'
 
 
-def make() -> dict:
+def _select() -> tuple[list[dict], dict, dict]:
+    """The A2 gate set + its counts + the injection-log index (shared by make/count)."""
     cal_keys = {_key(r) for r in _read_jsonl(CAL_PATH)}
     inj_by = {(r.get('session_id'), r.get('ts')): r
               for r in _read_jsonl(INJECTION_LOG_PATH)}
     rows, stats = select_gate_rows(_read_jsonl(V1_PATH), _read_jsonl(V2_PATH),
                                    cal_keys, inj_by, ej.resolve_transcript)
+    return rows, stats, inj_by
+
+
+def count() -> dict:
+    """Selection counts only — no rendering, no writes, no row content.
+
+    This is the number the accrual tripwire must gate on: a fresh HIGH row whose
+    transcript this machine cannot resolve is unjudgeable (A2) and can never be
+    labeled, so counting it would trip the gate under-powered."""
+    return _select()[1]
+
+
+def make() -> dict:
+    rows, stats, inj_by = _select()
     entries, turns_cache = [], {}
     for r in rows:
         sid = r['session_id']
@@ -253,9 +283,18 @@ def make() -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description='ej9 blind gate dossier (A4).')
-    ap.add_argument('cmd', choices=('make', 'parse'))
+    ap.add_argument('cmd', choices=('make', 'parse', 'count'),
+                    help="count = judgeable total on stdout (tripwire input), "
+                         "breakdown on stderr; writes nothing")
     args = ap.parse_args()
-    if args.cmd == 'make':
+    if args.cmd == 'count':
+        stats = count()
+        print(f"counted {stats['counted']} · judgeable {stats['judgeable']} "
+              f"(no_transcript {stats['no_transcript']}, "
+              f"no_injection_row {stats['no_injection_row']}) · target {TARGET}",
+              file=sys.stderr)
+        print(stats['judgeable'])
+    elif args.cmd == 'make':
         stats = make()
         print(f"gate dossier -> {OUT_PATH}")
         print(f"  counted {stats['counted']} · judgeable {stats['judgeable']} "

@@ -330,10 +330,43 @@ fi
 TOPIC_RECORDS_OUT=$(python "$KB_DIR/scripts/topic_records.py" 2>&1 || true)
 log "$TOPIC_RECORDS_OUT"
 
-# Append the current gate-accrual count (read-only; same "fresh HIGH" definition as
-# the 09:05 tripwire cron). Informational only — the tripwire itself still fires once.
+# 7b — bounded correction-harvest backfill (2026-08-20; collection-compatible per
+# the registration: "transcript backfill — grows Gate-1; cannot backfill the
+# curve"). Works the ~3,200-transcript backlog newest-first at
+# KB_HARVEST_BACKFILL_CAP (default 60) sonnet calls/night — the judge-cap
+# pattern: resumable, state-on-success-only, stops early on a cloud outage.
+# Harvested notes land in raw/inbox/ and ride tomorrow's ingestion normally.
+log "step 7b: correction-harvest backfill"
+BACKFILL_OUT=$(python "$KB_DIR/scripts/harvest_backfill.py" 2>&1 || true)
+log "$BACKFILL_OUT"
+
+# 8 — daily upkeep piggyback (2026-08-10). The original 09:00 heartbeat cron
+# assumed a machine awake at 09:00; the journal showed this PC never is, so the
+# upkeep block (transcript archive, rescore refresh, judge pass, compounding
+# tripwire) silently never ran — last genuine run 07-20, judge 0/903 eleven
+# nights after being wired ON. The 22:00 slot demonstrably fires, so upkeep
+# rides it; the morning cron (moved to 10:30) is an
+# idempotent bonus. The heartbeat's staleness check is quiet here by
+# construction (sync_meta was written moments ago). Never fatal to the pipeline.
+log "step 8: daily upkeep (heartbeat piggyback)"
+bash "$KB_DIR/scripts/heartbeat.sh" >> "$KB_DIR/logs/pipeline.log" 2>&1 || true
+
+# Append the current gate-accrual count (read-only; delegates to gate_dossier.py
+# count — the JUDGEABLE set). Informational only — the tripwire itself still fires once.
 GATE_ACCRUAL=$(bash "$KB_DIR/scripts/gate_accrual_check.sh" --count-only 2>/dev/null || echo '?')
-MSG="$MSG | 🎯 gate: ${GATE_ACCRUAL} fresh HIGH"
+MSG="$MSG | 🎯 gate: ${GATE_ACCRUAL} judgeable"
+
+# Rerank fallback count (scorer health when a rerank config is live). timeouts/
+# attempts (rate); ⚠Nerr means retrieve() crashed N times — zero by construction,
+# so any count is a surfacing bug. Bump KB_FALLBACK_SINCE when a new retrieval
+# config ships. With live retrieval LEXICAL (Task 9 ladder exhausted 2026-08-01;
+# GPU upgrade ≥2027) the count is 'n/a' indefinitely — suppress the line then,
+# rather than sending noise for months; it self-reactivates on any judge attempt.
+# Floor = window-open date, PAST the terminated k5f2 deploy's rows (its 21
+# attempts are a dead config's history, not current scorer health).
+FALLBACK=$(python "$KB_DIR/scripts/fallback_rate.py" --brief \
+  --since "${KB_FALLBACK_SINCE:-2026-08-05T00:00}" 2>/dev/null || echo '?')
+[ "$FALLBACK" != "n/a" ] && MSG="$MSG | ⏱ rerank fb: ${FALLBACK}"
 
 tg_send "🧠 LLM KB | $MSG"
 log "Pipeline finished"

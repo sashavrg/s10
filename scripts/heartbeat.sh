@@ -7,8 +7,14 @@
 # for the 2026-06-27 run. Run this from cron a few times a day, INDEPENDENTLY of
 # the pipeline, to catch a missed or failed nightly.
 #
-# Suggested crontab (checks at 09:00; 30h window flags a missed 22:00 run by then):
-#   0 9 * * *  /path/to/s10/scripts/heartbeat.sh
+# Suggested crontab (checks at 10:30 — a slot the machine is usually awake for;
+# 30h window flags a missed 22:00 run by then):
+#   30 10 * * *  /path/to/s10/scripts/heartbeat.sh
+#
+# ALSO invoked from run_pipeline.sh step 8: the original 09:00 slot
+# never fired (machine asleep every morning) and the upkeep block silently didn't
+# run for three weeks. The 22:00 pipeline slot is the primary trigger; the
+# morning cron (moved 09:00 -> 10:30) is an idempotent bonus.
 #
 # Exit 0 always (cron-friendly). Quiet when healthy; alerts via Telegram + stderr
 # when the last run is stale or errored. Tune the window with KB_HEARTBEAT_MAX_AGE_HOURS.
@@ -24,13 +30,27 @@ PY="$VENV_PY"
 [ -x "$VENV_PY" ] || PY="python3"
 
 # Gate-set upkeep (ej9 gate addendum A5): archive transcripts before retention
-# deletes them, then refresh the rescored analysis file — judge pass pinned OFF
-# pre-gate. Runs here so the 09:05 gate-accrual check always counts fresh,
-# retention-proofed data. Logged, never fatal to the heartbeat.
+# deletes them, then refresh the rescored analysis file. Runs here so the 10:35
+# gate-accrual check always counts fresh, retention-proofed data. Logged, never
+# fatal to the heartbeat.
+#
+# JUDGE PASS: ON since 2026-07-29 — the stage-1 gate PASSED (n=35, P=0.947/R=0.783),
+# which is the pre-committed condition for writing judge verdicts into the analysis
+# dataset. The cap bounds cloud spend per run: each judged row is one claude-sonnet-5
+# call (the gate-validated model — see engagement_judge.production_generate). Backlog
+# at flip time was 903 unjudged v2 rows, so ~23 nights to drain at 40/run; rows beyond
+# the cap stay v2 for the next night, and a cloud failure leaves a row at v2 rather
+# than faking a 3. Override with KB_JUDGE_MAX_CALLS (0 disables the judging loop;
+# grafting of previously-judged rows runs unconditionally either way).
+JUDGE_MAX_CALLS="${KB_JUDGE_MAX_CALLS:-40}"
 {
-  echo "[$(date -Iseconds)] gate-set upkeep"
+  echo "[$(date -Iseconds)] gate-set upkeep (judge cap ${JUDGE_MAX_CALLS})"
   "$KB_DIR/scripts/archive_transcripts.sh"
-  KB_JUDGE_MAX_CALLS=0 "$PY" "$KB_DIR/scripts/rescore_outcomes.py"
+  KB_JUDGE_MAX_CALLS="$JUDGE_MAX_CALLS" "$PY" "$KB_DIR/scripts/rescore_outcomes.py"
+  # One-shot notice when the reopened window hits its pre-registered read point.
+  # Silent until state/window_open exists (Task 10 Step 4), and silent forever after
+  # it fires once. Runs after the rescore so it counts the freshest rows.
+  "$KB_DIR/scripts/compounding_read_check.sh"
 } >> "$KB_DIR/logs/heartbeat.log" 2>&1 || true
 
 STATUS="$("$PY" - "$KB_DIR/state/sync_meta.json" "$MAX_AGE_HOURS" <<'PY'

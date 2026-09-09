@@ -201,3 +201,73 @@ def test_current_rows_filters_on_version_pair():
     ]
     out = sc.current_rows(rows, 'ejX')
     assert [r['injected'] for r in out] == ['a']
+
+
+# --------------------------------------------- reopened-window read point (Task 10)
+# The pre-registered exit is "depth>=1 HIGH n >= 40". The tripwire must count that,
+# not something adjacent — so the counter lives here, next to the curve it gates.
+
+def _o(sid, slug, ts, tier='high', project='p'):
+    return {'session_id': sid, 'injected': slug, 'ts': ts, 'tier': tier,
+            'project': project}
+
+
+def test_window_progress_counts_only_in_window_high_repeats():
+    rows = [
+        _o('s1', 'a', '2026-08-01T10:00:00'),                    # depth 0 in-window
+        _o('s2', 'a', '2026-08-02T10:00:00'),                    # depth 1 in-window ✓
+        _o('s3', 'a', '2026-08-03T10:00:00', tier='moderate'),   # repeat but MODERATE
+        _o('s4', 'b', '2026-07-01T10:00:00'),                    # pre-window
+        _o('s5', 'b', '2026-07-02T10:00:00'),                    # pre-window repeat
+    ]
+    p = sc.window_progress(rows, '2026-08-01')
+    assert p['n'] == 1
+    assert p['target'] == sc.WINDOW_TARGET
+    assert p['ready'] is False
+
+
+def test_window_progress_counts_depth_from_full_history_not_just_the_window():
+    """A topic first seen before the window is still a REPEAT when it recurs inside
+    it — depth is a property of the topic's history, not of the window."""
+    rows = [
+        _o('s1', 'a', '2026-07-01T10:00:00'),   # pre-window first touch
+        _o('s2', 'a', '2026-08-05T10:00:00'),   # in-window recurrence -> depth 1 ✓
+    ]
+    assert sc.window_progress(rows, '2026-08-01')['n'] == 1
+
+
+def test_window_progress_ready_at_the_target():
+    rows = []
+    for i in range(sc.WINDOW_TARGET + 1):          # +1 first-touch row per slug
+        rows.append(_o(f'first{i}', f'slug{i}', '2026-08-01T09:00:00'))
+        rows.append(_o(f'again{i}', f'slug{i}', '2026-08-02T09:00:00'))
+    p = sc.window_progress(rows, '2026-08-01')
+    assert p['n'] == sc.WINDOW_TARGET + 1
+    assert p['ready'] is True
+
+
+def test_window_progress_without_a_window_start_is_not_ready():
+    rows = [_o('s1', 'a', '2026-08-01T10:00:00'), _o('s2', 'a', '2026-08-02T10:00:00')]
+    p = sc.window_progress(rows, None)
+    assert p['n'] == 0 and p['ready'] is False
+
+
+def test_window_open_date_prefers_env_then_marker_then_none(tmp_path, monkeypatch):
+    marker = tmp_path / 'window_open'
+    monkeypatch.setattr(sc, 'WINDOW_MARKER', marker)
+    monkeypatch.delenv('KB_WINDOW_OPEN', raising=False)
+    assert sc.window_open_date() is None          # no window declared yet
+    marker.write_text('2026-08-01\n')
+    assert sc.window_open_date() == '2026-08-01'  # marker (Task 10 Step 4)
+    monkeypatch.setenv('KB_WINDOW_OPEN', '2026-09-09')
+    assert sc.window_open_date() == '2026-09-09'  # env overrides for dry runs
+
+
+def test_window_count_must_not_depend_on_rescore_freshness():
+    """The tripwire counts ACCRUAL; the live log is the accrual record. The
+    rescored analysis file lags (it refreshes only when upkeep runs), and a
+    stale-file count silently under-reads the window — observed 2026-08-10:
+    rescored said 0/40 while the live log held 19/40."""
+    import inspect
+    src = inspect.getsource(sc.main)
+    assert 'OUTCOME_PATH' in src.split('window_count')[1].split('return')[0]

@@ -25,6 +25,19 @@ RERANK_MODEL = os.environ.get('KB_RERANK_MODEL', 'qwen2.5:7b-instruct-q4_K_M')
 RERANK_TIMEOUT = float(os.environ.get('KB_RERANK_TIMEOUT', '60'))
 RERANK_FACTS = int(os.environ.get('KB_RERANK_FACTS', '3'))
 
+# Cloud judge pin (haiku rung, 2026-08-01). Alias 'haiku' resolved empirically via
+# modelUsage BEFORE dev (A1 lesson applied at the start this time); assert-and-abort
+# on mismatch in _generate_cloud — a verdict from any other model is never accepted,
+# the call raises and the caller takes the bounded lexical fallback. Changing this
+# pin is a NEW scorer: it changes retrieval_config and requires re-certification.
+RERANK_CLOUD_MODEL_ID = 'claude-haiku-4-5-20251001'
+
+
+def rerank_backend() -> str:
+    """'ollama' (default) | 'claude'. Read at call time so the hook's env pins
+    and per-process eval overrides both work without reloads."""
+    return os.environ.get('KB_RERANK_BACKEND', 'ollama').strip().lower()
+
 
 class RerankError(RuntimeError):
     pass
@@ -43,7 +56,7 @@ def _payload(prompt: str) -> dict:
     }
 
 
-def _generate(prompt: str) -> str:
+def _generate_ollama(prompt: str) -> str:
     data = json.dumps(_payload(prompt)).encode()
     req = urllib.request.Request(
         f'{OLLAMA_URL}/api/generate',
@@ -54,6 +67,33 @@ def _generate(prompt: str) -> str:
             return json.loads(r.read()).get('response', '')
     except Exception as e:
         raise RerankError(f'rerank generate failed: {e}') from e
+
+
+def _generate_cloud(prompt: str) -> str:
+    """One pinned cloud judge call, bounded by the rerank deadline.
+
+    `kb` is imported lazily (it pulls yaml/requests) so the default ollama path
+    keeps this module dep-free. Any failure — transport, timeout, pin mismatch —
+    raises RerankError; the caller's contract turns that into the bounded
+    lexical fallback with provenance. A verdict from an unpinned model is never
+    accepted (A1)."""
+    import kb  # noqa: PLC0415
+    try:
+        payload = kb.claude_code_payload(RERANK_CLOUD_MODEL_ID, prompt,
+                                         timeout=RERANK_TIMEOUT)
+    except Exception as e:
+        raise RerankError(f'cloud rerank failed: {e}') from e
+    models = sorted((payload.get('modelUsage') or {}).keys())
+    if models != [RERANK_CLOUD_MODEL_ID]:
+        raise RerankError(f'cloud rerank model pin violated: payload reports '
+                          f'{models}, expected [{RERANK_CLOUD_MODEL_ID!r}]')
+    return (payload.get('result') or '').strip()
+
+
+def _generate(prompt: str) -> str:
+    if rerank_backend() == 'claude':
+        return _generate_cloud(prompt)
+    return _generate_ollama(prompt)
 
 
 def _build_prompt(query: str, candidates: list[dict]) -> str:

@@ -38,6 +38,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import sys
 from pathlib import Path
 
 from topic_records import outcome_verdict   # canonical useful/harmful/neutral verdict
@@ -45,6 +47,10 @@ from topic_records import outcome_verdict   # canonical useful/harmful/neutral v
 BASE_DIR = Path(__file__).resolve().parent.parent
 OUTCOME_PATH = BASE_DIR / 'logs' / 'injection_outcomes.jsonl'
 RESCORED_PATH = BASE_DIR / 'logs' / 'injection_outcomes_rescored.jsonl'
+# Written by measurement-v2 Task 10 Step 4 when the collection window is declared
+# open (one ISO date). Absent = no window yet, and the compounding-read tripwire
+# stays silent rather than counting against a window that does not exist.
+WINDOW_MARKER = BASE_DIR / 'state' / 'window_open'
 
 # Compounding-curve depth buckets (Perplexity borrow: 0 / 1-3 / 4-10 / 10+).
 DEPTH_BUCKETS = (
@@ -100,6 +106,45 @@ def correctness_on_seen(outcomes: list[dict]) -> dict:
     useful = sum(1 for r in repeats if outcome_verdict(r) == 'useful')
     n = len(repeats)
     return {'repeat_injects': n, 'useful': useful, 'rate': (useful / n) if n else None}
+
+
+# The reopened collection window's pre-registered read point (measurement-v2 Task 10):
+# depth>=1 HIGH n >= 40 — enough for a ±15pp Wilson CI on the repeat bucket, which is
+# the bucket the compounding thesis actually turns on.
+WINDOW_TARGET = 40
+
+
+def window_open_date() -> str | None:
+    """ISO date the reopened collection window was declared open, or None.
+
+    Source of truth is state/window_open; KB_WINDOW_OPEN overrides it (testing, and
+    a dry-run before Task 10 commits the marker)."""
+    env = (os.environ.get('KB_WINDOW_OPEN') or '').strip()
+    if env:
+        return env
+    try:
+        return WINDOW_MARKER.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def window_progress(outcomes: list[dict], window_start: str | None) -> dict:
+    """How close the reopened window is to its first compounding read.
+
+    Counts HIGH-tier rows *inside* the window whose topic is a repeat. Depth is
+    computed over the FULL history first and only then filtered to the window: a
+    topic first touched before the window is still a repeat when it recurs inside it
+    — depth is a property of the topic's history, not of the window.
+
+    ``window_start`` is an ISO date/timestamp (prefix-compared against row ts); None
+    means no window has been declared open yet, which is 0 and never ready."""
+    if not window_start:
+        return {'n': 0, 'target': WINDOW_TARGET, 'ready': False, 'window_start': None}
+    n = sum(1 for r in enrich_depth(outcomes)
+            if r['repeat_topic'] and r.get('tier') == 'high'
+            and (r.get('ts') or '') >= window_start)
+    return {'n': n, 'target': WINDOW_TARGET, 'ready': n >= WINDOW_TARGET,
+            'window_start': window_start}
 
 
 def compounding_curve(outcomes: list[dict]) -> list[dict]:
@@ -235,8 +280,22 @@ def main() -> None:
     ap = argparse.ArgumentParser(description='Tier-stratified production scorecard.')
     default_log = RESCORED_PATH if RESCORED_PATH.exists() else OUTCOME_PATH
     ap.add_argument('--log', default=str(default_log))
+    ap.add_argument('--window-count', action='store_true',
+                    help="print the reopened window's depth>=1 HIGH count on stdout "
+                         '(the compounding-read tripwire input); writes nothing')
     args = ap.parse_args()
     outcomes = read_outcomes(args.log)
+    if args.window_count:
+        # Count accrual from the LIVE log unless --log was given explicitly: the
+        # rescored analysis file refreshes only when upkeep runs, and a stale
+        # file silently under-reads the window (2026-08-10: 0/40 vs a true 19/40).
+        if args.log == str(default_log) and str(default_log) != str(OUTCOME_PATH):
+            outcomes = read_outcomes(OUTCOME_PATH)
+        p = window_progress(outcomes, window_open_date())
+        print(f"window {p['window_start'] or '(not open)'} · depth>=1 HIGH "
+              f"{p['n']}/{p['target']}", file=sys.stderr)
+        print(p['n'])
+        return
     from collections import Counter
     pairs = Counter(
         (r.get('scorer_version') if 'scorer_version' in r else 1, r.get('judge_version'))

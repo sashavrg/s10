@@ -27,8 +27,20 @@ from components.** Keep it current when you change the loop.
                           (thresholds, blocklist)     (compiled topics + facts)
                                     │  read by              │ read by
                                     ▼                       ▼
+  [SessionStart] ── settings.json ──> scripts/warm_reranker.sh   (detached; preloads the
+        session opens                 rerank judge model with the 2h keepalive so first-turn
+                                      rerank is warm — semantics-preserving, Task 9 flip)
+
   [UserPromptSubmit] ── settings.json ──> scripts/memory_inject_hook.py
         every prompt                         │  scores (memory_index.py), tiers, injects HIGH
+                                             │  LIVE SCORER since 2026-07-29: RERANK with bounded
+                                             │  lexical fallback (KB_RETRIEVAL=rerank, internal
+                                             │  6s deadline under the 10s hook kill). Judge call
+                                             │  fails -> lexical injected; every row stamps
+                                             │  retrieval_mode (+ rerank_timeout when true); a
+                                             │  retrieve() crash logs tier='error' — NO code path
+                                             │  drops a row. Burn-in gate: fallback < 15%
+                                             │  (scripts/fallback_rate.py, pre-committed).
                                              ├─> logs/memory_injection.jsonl   (EVERY decision; carries session_id)
                                              └─> if state/shadow_retrieval.enabled:
                                                    Popen(detached) scripts/shadow_retrieval.py
@@ -52,6 +64,12 @@ from components.** Keep it current when you change the loop.
           session_ids are disjoint so the PC SessionEnd scorer ignores foreign rows).
           Harvested corrections ride the raw/inbox symlink instead, so only these two
           logs need merging. Without this the loop learns from PC traffic only.
+          SAME STEP also fetches the TRANSCRIPTS for merged outcome sessions that don't
+          resolve locally → logs/transcript_archive/<remote-project-dir>/ (rsync of
+          the server's ~/.claude/projects). Rows without a transcript are unjudgeable (A2): they
+          count toward gate accrual but can never be labeled/judged — this stranded 8
+          of 35 fresh HIGH rows at the 2026-07-29 trip. Steady state = no SSH call
+          (already-resolvable sessions are skipped); --no-transcripts opts out.
 
   [nightly cron 22:00] ── run_pipeline.sh ──> scripts/audit_hooks.py        (step 6, opt-in KB_HOOK_AUTOTUNE)
                                              reads logs/memory_injection.jsonl   (synthetic-event false-HIGH signal)
@@ -77,10 +95,17 @@ from components.** Keep it current when you change the loop.
                           Nightly judge pass: v2 rows are queued oldest-first and re-verdicted by
                           └→ scripts/engagement_judge.py (offline semantic ENGAGED/not-engaged verdict,
                              replacing the failed v2 token-overlap proxy) → scorer_version=3 + judge_version
-                             stamped per row, capped at KB_JUDGE_MAX_CALLS/run — default **0, pre-gate**
-                             (judge unvalidated; verdicts aren't written into the analysis dataset until
-                             the gate passes — flip to a positive value at gate pass; rows
-                             beyond the cap stay v2 for the next night). graft_previous_judgments() runs
+                             stamped per row, capped at KB_JUDGE_MAX_CALLS/run — **ON since 2026-07-29**,
+                             default 40/run in heartbeat.sh (the stage-1 gate PASSED at P=0.947/R=0.783,
+                             the pre-committed condition for writing verdicts into the analysis dataset;
+                             backlog was 903 v2 rows ≈ 23 nights to drain; rows beyond the cap stay v2 for
+                             the next night). The production path injects
+                             ej.production_generate — the SAME cloud model the gate validated
+                             (JUDGE_MODEL_ID = claude-sonnet-5, test-pinned equal to gate_read's pin).
+                             The module default generate_fn is OLLAMA, so this injection is load-bearing:
+                             a local verdict stamped 'ej9-claude-sonnet' would corrupt the dataset.
+                             A cloud failure returns None → the row stays v2; a 3 is never faked.
+                             graft_previous_judgments() runs
                              UNCONDITIONALLY (even at max_calls=0) and carries a previously-judged row's
                              verdict forward verbatim when its judge_version is unchanged — a cached
                              fact, never re-rolled (topic_records-style idempotence).
@@ -183,8 +208,18 @@ python -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude/set
 # the SessionEnd chain actually calls the scorer (grep the two shell hops):
 grep -n injection_outcome scripts/session_end.sh
 # cross-host merge (PC only): what the server's interactive sessions WOULD contribute
-# (idempotent — a real run appends; re-run is +0). Needs SSH to the home server:
+# (idempotent — a real run appends; re-run is +0, and `transcripts+0 (all resolvable)`
+# means no SSH listing was even needed). Needs SSH to the home server:
 python scripts/merge_remote_logs.py --dry-run
+# gate accrual: the JUDGEABLE count (A2 selection), not raw fresh HIGH — the tripwire
+# delegates to gate_dossier so the two definitions cannot drift:
+python scripts/gate_dossier.py count && ./scripts/gate_accrual_check.sh --count-only
+# compounding-read tripwire (fires once at the reopened window's read point,
+# depth>=1 HIGH >= 40; silent until state/window_open exists — Task 10 Step 4).
+# Counts via scorecard --window-count, i.e. the same enrich_depth() the curve uses.
+# Run from heartbeat.sh; --count-only is the safe manual probe:
+./scripts/compounding_read_check.sh --count-only
+KB_WINDOW_OPEN=2026-07-01 ./scripts/compounding_read_check.sh --count-only   # dry-run a date
 # the scorer is producing rows (status lines):
 tail -3 logs/injection_outcome.log
 # auto-tune consumes both signals + what it WOULD do (no commit):

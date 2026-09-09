@@ -557,14 +557,19 @@ def classify_cloud_error(text: str) -> str:
     return 'other'
 
 
-def claude_code_payload(model: str, prompt: str) -> dict:
+def claude_code_payload(model: str, prompt: str, timeout: float | None = None) -> dict:
     """Run one headless Claude Code completion and return the FULL parsed CLI
     payload (the gate-read runner asserts its `modelUsage` — ej9 addendum A1).
 
     Pipes the prompt via stdin, runs from a neutral cwd so the call does not
     auto-load this repo's CLAUDE.md/skills, and scrubs ANTHROPIC_API_KEY so the
     subscription OAuth token is used. Raises CloudLLMError on any failure.
+
+    ``timeout`` overrides CLAUDE_CLI_TIMEOUT (900s, pipeline-scale). Latency-
+    bounded callers — the live reranker's cloud judge — MUST pass their own
+    deadline: a hung call past the hook's 10s kill is a dropped collection row.
     """
+    timeout = timeout if timeout is not None else CLAUDE_CLI_TIMEOUT
     env = dict(os.environ)
     env.pop('ANTHROPIC_API_KEY', None)
     # Mark this as a KB-internal headless call. A `claude -p` invocation is itself
@@ -580,14 +585,14 @@ def claude_code_payload(model: str, prompt: str) -> dict:
             input=prompt,
             capture_output=True,
             text=True,
-            timeout=CLAUDE_CLI_TIMEOUT,
+            timeout=timeout,
             cwd=tempfile.gettempdir(),
             env=env,
         )
     except FileNotFoundError as e:
         raise CloudLLMError('other', 'claude CLI not found on PATH') from e
     except subprocess.TimeoutExpired as e:
-        raise CloudLLMError('network', f'claude timed out after {CLAUDE_CLI_TIMEOUT}s') from e
+        raise CloudLLMError('network', f'claude timed out after {timeout}s') from e
     if proc.returncode != 0:
         blob = (proc.stderr or '') + (proc.stdout or '')
         raise CloudLLMError(classify_cloud_error(blob), blob.strip()[:500])

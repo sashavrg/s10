@@ -219,3 +219,38 @@ def test_make_writes_dossier_from_synthetic_files(tmp_path, monkeypatch):
     assert md.count('## Row') == 2
     assert 'alpha fact' in md and 'beta fact' in md
     assert 'gamma-topic' not in md and 'cal-topic' not in md
+
+
+def test_count_reports_judgeable_and_writes_nothing(tmp_path, monkeypatch):
+    """The accrual tripwire reads THIS count (A2 judgeable), not raw fresh HIGH:
+    a row whose transcript this machine cannot resolve can never be labeled."""
+    head = 'work on the alpha thing'
+    v1 = [_row('sA', '2026-07-04T10:00:00', 'alpha-topic'),
+          _row('sX', '2026-07-05T10:00:00', 'x-topic')]      # transcript unreachable
+    inj = [_inj('sA', '2026-07-04T10:00:00', 'alpha-topic', head, ['alpha fact']),
+           _inj('sX', '2026-07-05T10:00:00', 'x-topic', 'h', ['f'])]
+
+    (tmp_path / 'projects' / 'proj').mkdir(parents=True)
+    turns = [{'message': {'role': 'user', 'content': head}},
+             {'message': {'role': 'assistant', 'content': f'doing {head} now'}}]
+    (tmp_path / 'projects' / 'proj' / 'sA.jsonl').write_text(
+        '\n'.join(json.dumps(x) for x in turns))
+
+    def jl(name, rows):
+        p = tmp_path / name
+        p.write_text('\n'.join(json.dumps(r) for r in rows))
+        return p
+
+    monkeypatch.setattr(gd, 'V1_PATH', jl('v1.jsonl', v1))
+    monkeypatch.setattr(gd, 'V2_PATH', tmp_path / 'absent.jsonl')
+    monkeypatch.setattr(gd, 'CAL_PATH', tmp_path / 'absent-cal.jsonl')
+    monkeypatch.setattr(gd, 'INJECTION_LOG_PATH', jl('inj.jsonl', inj))
+    monkeypatch.setattr(gd, 'OUT_PATH', tmp_path / 'out' / 'dossier.md')
+    monkeypatch.setattr(ej, 'TRANSCRIPT_ROOT', tmp_path / 'projects')
+    monkeypatch.setattr(ej, 'ARCHIVE_ROOT', tmp_path / 'no-archive')
+
+    stats = gd.count()
+
+    assert stats == {'counted': 2, 'judgeable': 1,
+                     'no_transcript': 1, 'no_injection_row': 0}
+    assert not (tmp_path / 'out').exists()   # counting renders nothing

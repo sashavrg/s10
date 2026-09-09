@@ -231,7 +231,9 @@ def _production_judge_row_fn(inj_by_key: dict, turns_cache: dict):
         ev = ej.build_evidence(inj_eff, turns, page)
         meta = {'n_snippets': ev['n_snippets'], 'nomination_empty': ev['nomination_empty'],
                 'anchored': ev['anchored']}
-        return ej.judge_engagement(ev), meta
+        # Explicit cloud backend: the module default is Ollama, and a local verdict
+        # stamped with the gate-validated JUDGE_VERSION would corrupt the dataset.
+        return ej.judge_engagement(ev, generate_fn=ej.production_generate), meta
     return judge_row
 
 

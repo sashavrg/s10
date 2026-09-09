@@ -74,3 +74,46 @@ def test_merge_one_missing_staged_file_is_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(m, 'LOGS_DIR', logs)
     # remote never produced this log yet (e.g. injection_outcomes pre-first-SessionEnd)
     assert m.merge_one('injection_outcomes.jsonl', staging, dry_run=False) == 0
+
+
+# ------------------------------------------------- transcript sync (gate A2)
+# Merged outcome rows are only *judgeable* if their transcript is reachable on
+# this machine; without this the server's rows count toward accrual but can
+# never be labeled or judged. Pure selection logic only — no SSH here.
+
+def test_outcome_sessions_collects_distinct_ids_and_ignores_junk():
+    lines = ['{"session_id":"s1","ts":"t1"}',
+             '',
+             '   ',
+             'not json at all',
+             '{"ts":"t2"}',                    # sessionless row
+             '{"session_id":"","ts":"t3"}',    # empty id
+             '{"session_id":"s1","ts":"t4"}',  # dupe
+             '{"session_id":"s2","ts":"t5"}']
+    assert m.outcome_sessions(lines) == {'s1', 's2'}
+
+
+def test_sessions_missing_transcripts_skips_locally_resolvable():
+    resolve = lambda sid: '/tx/found.jsonl' if sid == 's1' else None
+    assert m.sessions_missing_transcripts({'s2', 's1', 's3'}, resolve) == ['s2', 's3']
+
+
+def test_sessions_missing_transcripts_empty_when_all_resolve():
+    assert m.sessions_missing_transcripts({'s1'}, lambda sid: '/tx') == []
+
+
+def test_transcript_fetch_list_maps_listing_to_relative_paths():
+    listing = ['-root/s2.jsonl', '-root/s9.jsonl', '-mnt-storage/s3.jsonl',
+               'no-extension', '', 'top-level.jsonl']
+    # only wanted sessions, sorted for a deterministic rsync file list
+    assert m.transcript_fetch_list(listing, ['s3', 's2']) == \
+        ['-mnt-storage/s3.jsonl', '-root/s2.jsonl']
+
+
+def test_transcript_fetch_list_takes_first_of_duplicate_session_dirs():
+    listing = ['-b-dir/s1.jsonl', '-a-dir/s1.jsonl']
+    assert m.transcript_fetch_list(listing, ['s1']) == ['-a-dir/s1.jsonl']
+
+
+def test_transcript_fetch_list_empty_when_nothing_wanted():
+    assert m.transcript_fetch_list(['-root/s1.jsonl'], []) == []

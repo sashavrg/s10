@@ -231,8 +231,9 @@ def test_production_judge_row_fn_builds_inj_eff_for_moderate_rows(tmp_path, monk
     monkeypatch.setattr(ej, 'load_topic_page', lambda slug: {'overview': '', 'points': []})
 
     captured = {}
-    def capturing_judge(ev):
+    def capturing_judge(ev, generate_fn=None):
         captured['ev'] = ev
+        captured['generate_fn'] = generate_fn
         return {'engaged': True, 'rationale': 'x'}
     monkeypatch.setattr(ej, 'judge_engagement', capturing_judge)
 
@@ -248,3 +249,47 @@ def test_production_judge_row_fn_builds_inj_eff_for_moderate_rows(tmp_path, monk
 
     assert captured['ev']['topic_slug'] == 'some-slug'   # not None
     assert verdict == {'engaged': True, 'rationale': 'x'}
+
+
+# --------------------------------------------- production judge backend (gate pass)
+# The judge was validated at the gate as claude-sonnet-5 and every judged row is
+# stamped JUDGE_VERSION='ej9-claude-sonnet'. The module default generate_fn is
+# OLLAMA — so the nightly MUST inject the cloud backend explicitly, or it would
+# write local-model verdicts under the validated judge's name.
+
+def test_judge_model_pin_matches_the_gate_read_pin():
+    import engagement_judge as ej
+    import gate_read
+    assert ej.JUDGE_MODEL_ID == gate_read.GATE_MODEL_ID
+
+
+def test_production_judge_injects_the_cloud_backend_not_ollama(monkeypatch):
+    import engagement_judge as ej
+    seen = {}
+
+    def fake_judge(evidence, generate_fn=None):
+        seen['generate_fn'] = generate_fn
+        return {'engaged': True, 'rationale': 'r'}
+
+    monkeypatch.setattr(ro.ej, 'judge_engagement', fake_judge)
+    monkeypatch.setattr(ro.ej, 'resolve_transcript', lambda sid: '/tx/s.jsonl')
+    monkeypatch.setattr(ro, 'parse_turns', lambda p: [{'role': 'user', 'text': 'hi'}])
+    monkeypatch.setattr(ro.ej, 'build_evidence', lambda *a, **k: {
+        'n_snippets': 1, 'nomination_empty': False, 'anchored': True})
+
+    judge_row = ro._production_judge_row_fn({('s1', 't1'): {'session_id': 's1', 'ts': 't1'}}, {})
+    verdict, meta = judge_row({'session_id': 's1', 'ts': 't1', 'injected': 'slug', 'tier': 'high'})
+
+    assert verdict == {'engaged': True, 'rationale': 'r'}
+    assert seen['generate_fn'] is ej.production_generate
+    assert seen['generate_fn'] is not ej._generate
+
+
+def test_production_generate_calls_the_pinned_cloud_model(monkeypatch):
+    import engagement_judge as ej
+    import kb
+    calls = {}
+    monkeypatch.setattr(kb, 'claude_code_generate',
+                        lambda model, prompt: calls.setdefault('model', model) or 'ENGAGED: yes')
+    ej.production_generate('prompt text')
+    assert calls['model'] == ej.JUDGE_MODEL_ID

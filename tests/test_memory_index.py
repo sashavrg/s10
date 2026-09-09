@@ -176,3 +176,104 @@ def test_split_frontmatter_strips_yaml_quotes():
     dt.datetime.fromisoformat(meta['compiled_at'])               # now ISO-parseable, must not raise
     assert meta['source_ids'] == ['abc', 'def']                  # list items unquoted too
     assert meta['topic'] == 'Foo'
+
+
+## --- bounded fallback on judge failure (Task 9 flip, operator-signed 2026-07-29) --
+# A rerank judge call that FAILS (timeout/transport) is not a verdict. The certified
+# semantics for a "none relevant" VERDICT is advertise-only; a failed CALL must fall
+# back to the LEXICAL scorer with provenance (mode='lexical', rerank_timeout=True) so
+# no would-inject turn is lost and no row misreports its scorer. Invariant: no code
+# path may end in a dropped row.
+
+def _judge_dies(monkeypatch):
+    import reranker
+
+    def boom(q, c):
+        raise reranker.RerankError('rerank generate failed: timeout')
+    monkeypatch.setattr(reranker, 'rerank', boom)
+
+
+def _lex_by_slug(monkeypatch, table):
+    monkeypatch.setattr(mi, 'score_entry', lambda q, e, t=None: table.get(e['slug'], 0.0))
+
+
+def test_judge_failure_falls_back_to_lexical_with_provenance(monkeypatch):
+    _rerank_scenario(monkeypatch, [0.70, 0.62])      # embedding order: t0 > t1
+    _judge_dies(monkeypatch)
+    _lex_by_slug(monkeypatch, {'t1': 0.9})           # lexically, t1 is the clear hit
+    res = mi.retrieve('q')
+    assert res['mode'] == 'lexical'                  # names the scorer that ACTUALLY ran
+    assert res['rerank_timeout'] is True
+    assert res['matches'][0]['slug'] == 't1'         # lexical ordering, not embedding's
+    assert res['top_tier'] == 'high'                 # 0.9 >= 0.73 -> still injects
+
+
+def test_judge_failure_with_no_lexical_match_is_none_not_dropped(monkeypatch):
+    _rerank_scenario(monkeypatch, [0.70, 0.62])
+    _judge_dies(monkeypatch)
+    _lex_by_slug(monkeypatch, {})                    # nothing matches lexically
+    res = mi.retrieve('q')
+    assert res['mode'] == 'lexical' and res['rerank_timeout'] is True
+    assert res['top_tier'] == 'none'                 # a silent turn, but a REPORTED one
+
+
+def test_judge_none_verdict_is_not_a_timeout(monkeypatch):
+    # "0 = none relevant" is a certified rerank VERDICT: advertise-only, no fallback.
+    _rerank_scenario(monkeypatch, [0.70, 0.62])
+    _spy_reranker(monkeypatch, winner=None)
+    res = mi.retrieve('q')
+    assert res['mode'] == 'rerank'
+    assert res['rerank_timeout'] is False
+    assert res['top_tier'] != 'high'
+
+
+def test_rerank_success_reports_no_timeout(monkeypatch):
+    _rerank_scenario(monkeypatch, [0.70, 0.62])
+    _spy_reranker(monkeypatch, winner=0)
+    res = mi.retrieve('q')
+    assert res['mode'] == 'rerank' and res['rerank_timeout'] is False
+
+
+## --- retrieval_config version pin (k5f2 ship, operator-signed 2026-07-29) --------
+# Task 10 pins the deployed retrieval config via this per-row identifier: the
+# result names the ATTEMPTED config even when the judge call fails and lexical
+# runs — "attempted rerank-k5f2, fell back" is the row's full story.
+
+def test_result_carries_retrieval_config_for_rerank(monkeypatch):
+    _rerank_scenario(monkeypatch, [0.70, 0.62])
+    monkeypatch.setenv('KB_RERANK_K', '5')
+    monkeypatch.setenv('KB_RERANK_FACTS', '2')
+    monkeypatch.setenv('KB_RERANK_MODEL', 'llama3.2:3b')
+    _spy_reranker(monkeypatch, winner=0)
+    res = mi.retrieve('q')
+    assert res['retrieval_config'] == 'rerank-k5f2@llama3.2:3b'
+
+
+def test_timeout_fallback_keeps_the_attempted_config(monkeypatch):
+    _rerank_scenario(monkeypatch, [0.70, 0.62])
+    monkeypatch.setenv('KB_RERANK_K', '5')
+    monkeypatch.setenv('KB_RERANK_FACTS', '2')
+    monkeypatch.setenv('KB_RERANK_MODEL', 'llama3.2:3b')
+    _judge_dies(monkeypatch)
+    _lex_by_slug(monkeypatch, {'t1': 0.9})
+    res = mi.retrieve('q')
+    assert res['mode'] == 'lexical'                                  # what ran
+    assert res['retrieval_config'] == 'rerank-k5f2@llama3.2:3b'      # attempted
+
+
+def test_plain_lexical_config_is_lexical(monkeypatch):
+    monkeypatch.delenv('KB_RETRIEVAL', raising=False)
+    monkeypatch.setattr(mi, 'load_index', lambda: {'entries': []})
+    res = mi.retrieve('q')
+    assert res['retrieval_config'] == 'lexical'
+
+
+def test_retrieval_config_names_the_cloud_judge_model(monkeypatch):
+    # New model = new scorer: the config string must change with the pin, so a
+    # future cloud-model bump can never masquerade as the certified config.
+    import reranker
+    _rerank_scenario(monkeypatch, [0.70, 0.62])
+    monkeypatch.setenv('KB_RERANK_BACKEND', 'claude')
+    _spy_reranker(monkeypatch, winner=0)
+    res = mi.retrieve('q')
+    assert res['retrieval_config'] == f'rerank-k10f3@{reranker.RERANK_CLOUD_MODEL_ID}'

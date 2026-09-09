@@ -23,6 +23,11 @@ import urllib.request
 # Round 2: the rubric judge. Model is claude:sonnet via the cloud driver (dev/gate);
 # production backend wiring lands only on a gate pass and MUST match this version's model.
 JUDGE_VERSION = 'ej9-claude-sonnet'
+# The model the stage-1 gate validated on 2026-07-29 (P=0.947/R=0.783, n=35). Every row
+# stamped JUDGE_VERSION must have been judged by THIS model — test-pinned equal to
+# gate_read.GATE_MODEL_ID, because a verdict from any other model under this version
+# string silently corrupts the analysis dataset.
+JUDGE_MODEL_ID = 'claude-sonnet-5'
 
 OLLAMA_URL = os.environ.get('KB_OLLAMA_URL', 'http://127.0.0.1:11434').rstrip('/')
 ENGAGE_MODEL = os.environ.get('KB_ENGAGE_MODEL', 'qwen2.5:7b-instruct-q4_K_M')
@@ -233,6 +238,20 @@ def _build_prompt(ev: dict) -> str:
               'WHY: <one short sentence, naming the rule you applied (e.g. R2) or the '
               'matched example>']
     return '\n'.join(lines)
+
+
+def production_generate(prompt: str) -> str:
+    """The judge's PRODUCTION backend — the same cloud model the gate validated.
+
+    The module default (`_generate`) is Ollama, which is right for cheap local work
+    but wrong for anything stamped JUDGE_VERSION: the gate validated claude-sonnet-5,
+    so the nightly must inject this explicitly. `kb` is imported lazily so this module
+    stays import-light for the hooks (kb pulls in yaml/requests).
+
+    Raises on failure — `judge_engagement` catches it and returns None, which leaves
+    the row at scorer_version 2 for the next night. A 3 is never faked."""
+    import kb
+    return kb.claude_code_generate(JUDGE_MODEL_ID, prompt)
 
 
 def judge_engagement(evidence: dict, generate_fn=None) -> dict | None:

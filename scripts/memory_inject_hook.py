@@ -19,12 +19,68 @@ nothing adds nothing.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import datetime as dt
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / 'scripts'))
+
+# Live retrieval config, pinned for the collection window: RERANK with bounded
+# lexical fallback (measurement-v2 Task 9, operator-signed 2026-07-29).
+#
+# All three pre-committed criteria held — golden-set hit@1 44% vs lexical 19%
+# (bar: +15pts), real-negative false-HIGH 12% (bar: <=15%), shadow judge
+# reject-rate 55% (band: 40-65%). Deploy shape, per the operator's resolution of
+# the latency problem (rerank measured 7-12s COLD vs the 10s hook kill):
+#
+#   1. INTERNAL deadline, safely under the kill: KB_RERANK_TIMEOUT=6. On expiry the
+#      judge call fails WITHOUT a verdict and memory_index.retrieve() injects the
+#      LEXICAL result instead, reporting mode='lexical' + rerank_timeout=True — no
+#      code path may end in a dropped row, and every row names its real scorer.
+#   2. Semantics-preserving warm strategy only: SessionStart warm-up (warm_reranker.sh)
+#      preloads the judge model, and the keepalive spans real inter-turn gaps. Warm,
+#      the judge is ~1-2s. NOT allowed under the existing certification: smaller
+#      judge model, reduced K, prompt edits — any of those is a NEW scorer and goes
+#      through the eval gate before it may ship.
+#   3. Burn-in threshold, pre-committed before data: window reopen requires
+#      fallback rate (rerank_timeout rows / retrieval rows) < 15% over the 3-day
+#      burn-in (probe: scripts/fallback_rate.py). Above it, the flip is fictional
+#      — THAT triggers designing a faster rerank variant through the full eval gate.
+#
+# STATUS 2026-07-29 (operator-signed): live scorer = RERANK-K5F2 with bounded
+# lexical fallback — the variant that survived the ladder after the certified
+# k10f3's warm-prefill (6-11s/fresh prompt, CPU-offloaded 7B) lost every turn to
+# the 6s deadline. Ladder record: (a) full-GPU judge — dead, embed already 0 VRAM
+# and a forced num_gpu=99 load FAILS outright on the 6GB card; (b) K/facts sweep
+# through the eval gate — k5f2 passed (hit@1 38% >= 34% bar, false-HIGH 8%,
+# latency n=13 mean 3.80s max 4.73s, 0/13 over the deadline); (c) smaller judge
+# model — not reached. Quality trade, stated not absorbed: -6pp hit@1 vs k10f3
+# (38% vs 44%), false-HIGH improved (8% vs 12%), traded for deployability.
+#
+# The 15% burn-in fallback gate (scripts/fallback_rate.py, stratified by prompt
+# length) is the arbiter: a fat latency tail -> stamped fallback rows -> the gate
+# re-fires the ABOVE branch. Rows pin the config via retrieval_config
+# ('rerank-k5f2'), which names the ATTEMPTED scorer even on fallback rows.
+#
+# STATUS 2026-08-01 (operator-signed): k5f2-on-7B burn-in TERMINATED BY
+# SIDE-CHANNEL — desktop applications crashing under the resident 7B's GPU
+# pressure. Same precedent as the prefill early-invoke: the ABOVE-threshold
+# branch firing on mechanism evidence. Live retrieval is LEXICAL again; the
+# 7B judge is unloaded and the SessionStart warm-up unregistered. The partial
+# burn-in data (0 timeouts at termination) is NOT a k5f2 verdict and must never
+# be read as one — the window it would have fed never opened.
+#
+# Next ladder rung: cloud haiku as the reranker judge — CANDIDATE, not choice;
+# it becomes the choice when it clears BOTH gate sets (golden hit@1 >= 34%,
+# real-negatives false-HIGH <= 15%) plus the pre-committed latency bar. Primary
+# candidate is k10f3-on-haiku (k5f2 existed only to shrink prefill through the
+# CPU-offloaded 7B; that constraint is gone with a zero-VRAM judge, so the full
+# certified shape is recovered). Re-enable = setdefaults for KB_RETRIEVAL=rerank,
+# KB_RERANK_BACKEND=claude, K/F per the certified config, fitted timeout; no
+# keepalive (nothing resident).
+# os.environ.setdefault('KB_RETRIEVAL', 'rerank')     # awaiting haiku certification
 
 LOG_PATH = BASE_DIR / 'logs' / 'memory_injection.jsonl'
 
@@ -73,6 +129,10 @@ def maybe_shadow(prompt: str, project: str | None, session_id: str, res: dict) -
         matches = res.get('matches', [])
         job = {
             'prompt': prompt, 'project': project, 'session_id': session_id,
+            # Field names are historical ('lexical_*' = "the LIVE decision"); since
+            # the 2026-07-29 rerank flip the live scorer varies, so live_mode records
+            # which one actually produced these values — filter on it in analysis.
+            'live_mode': res.get('mode'),
             'lexical_top_tier': res.get('top_tier'),
             'lexical_high': [m['slug'] for m in matches if m['tier'] == 'high'],
             'lexical_injected': (matches[0]['slug']
@@ -142,13 +202,30 @@ def main() -> None:
 
     try:
         res = mi.retrieve(prompt, project=project)
-    except Exception:
+    except Exception as e:
+        # No-dropped-row invariant (Task 9): fail-open on the TURN (inject nothing)
+        # but never on the LOG — a vanished row is the silent-attrition class that
+        # voided the first collection window.
+        log_decision({
+            'tier': 'error', 'project': project, 'session_id': session_id,
+            'prompt_head': prompt[:120],
+            'reason': f'retrieve failed: {type(e).__name__}: {e}'[:200],
+        })
         return
 
     matches = res.get('matches', [])
     top_tier = res.get('top_tier', 'none')
+    # Per-row scorer provenance: which scorer ACTUALLY produced this decision
+    # (retrieval_mode), which config was ATTEMPTED (retrieval_config — the Task 10
+    # pin), and the prompt length (prefill scales with it; the burn-in report
+    # stratifies fallback rate by this). rerank_timeout appears only when true.
+    provenance = {'retrieval_mode': res.get('mode'),
+                  'retrieval_config': res.get('retrieval_config'),
+                  'prompt_chars': len(prompt)}
+    if res.get('rerank_timeout'):
+        provenance['rerank_timeout'] = True
 
-    # Out-of-band: log what the embedding scorer WOULD inject (still inject lexical).
+    # Out-of-band: log what the shadow scorer WOULD inject (live decision unchanged).
     maybe_shadow(prompt, project, session_id, res)
 
     if top_tier == 'high':
@@ -162,6 +239,7 @@ def main() -> None:
             # The actual injected facts, so the outcome scorer and the future
             # eval set can measure the utility of CONTENT, not just the slug.
             'injected_facts': top['key_points'][:MAX_FACTS_HIGH],
+            **provenance,
         })
         print(out)
         return
@@ -179,6 +257,7 @@ def main() -> None:
             'advertised': [m['slug'] for m in mods],
             'top_score': mods[0]['score'] if mods else 0.0,
             'suppressed': True,  # logged for tuning, not injected (HIGH-only mode)
+            **provenance,
         })
         return
 
@@ -188,6 +267,7 @@ def main() -> None:
         'tier': 'none', 'project': project, 'session_id': session_id,
         'prompt_head': prompt[:120],
         'best_score': matches[0]['score'] if matches else 0.0,
+        **provenance,
     })
 
 

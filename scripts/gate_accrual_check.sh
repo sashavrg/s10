@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Gate-accrual tripwire (#1e round 2): Telegram-notify ONCE when fresh HIGH rows
-# reach the full-power gate threshold (default 35; KB_GATE_HIGH_TARGET overrides).
+# Gate-accrual tripwire (#1e round 2): Telegram-notify ONCE when the JUDGEABLE gate
+# set reaches the full-power threshold (default 35; KB_GATE_HIGH_TARGET overrides).
 #
-# "Fresh HIGH" = tier=high rows with a session_id, union of the LIVE outcome log and
-# the rescored file, whose (session_id, ts, injected) key is NOT in the calibration
-# set — the same definition the gate dossier will use. Fires once (marker:
+# The count is delegated to `gate_dossier.py count` — the A2 selection itself — so the
+# tripwire and the dossier can never disagree. Judgeable = fresh HIGH (tier=high with a
+# session_id, union of the LIVE outcome log and the rescored file, calibration keys
+# excluded) AND transcript-resolvable AND joined to an injection-log row. An earlier
+# version reimplemented only the "fresh HIGH" half here and tripped 8 rows early
+# (2026-07-29): the server-merged rows counted but had no transcript on this machine,
+# so the dossier refused at judgeable 27/35. Fires once (marker:
 # state/gate_accrual_notified), then stays quiet. Read-only on all measurement data.
 #
-# Crontab (after heartbeat):  5 9 * * *  /path/to/s10/scripts/gate_accrual_check.sh
+# Crontab (after heartbeat):  35 10 * * *  /path/to/s10/scripts/gate_accrual_check.sh
 # Test the Telegram wiring:   ./scripts/gate_accrual_check.sh --test
 # Print just COUNT/TARGET (no notify, no marker; for the nightly post-run notice):
 #                             ./scripts/gate_accrual_check.sh --count-only
@@ -25,44 +29,27 @@ notify() {
 }
 
 if [ "${1:-}" = "--test" ]; then
-  notify "🧪 KB gate tripwire — wiring test OK (target: fresh HIGH >= ${TARGET})"
+  notify "🧪 KB gate tripwire — wiring test OK (target: judgeable >= ${TARGET})"
   echo "[gate-accrual] test notification sent"
 fi
 
-COUNT="$("$PY" - "$KB_DIR" <<'PY'
-import json, sys
-from pathlib import Path
-kb = Path(sys.argv[1])
-def rows(p):
-    out = []
-    try:
-        for l in p.read_text(errors='replace').splitlines():
-            l = l.strip()
-            if not l or l.startswith('#'): continue
-            try: out.append(json.loads(l))
-            except json.JSONDecodeError: continue
-    except OSError: pass
-    return out
-cal = {(r.get('session_id'), r.get('ts'), r.get('injected'))
-       for r in rows(kb / 'evals/fixtures/engagement_calibration_2026-07-03.jsonl')}
-seen = set()
-for p in (kb / 'logs/injection_outcomes.jsonl', kb / 'logs/injection_outcomes_rescored.jsonl'):
-    for r in rows(p):
-        if r.get('tier') != 'high' or not r.get('session_id'): continue
-        k = (r['session_id'], r.get('ts'), r.get('injected'))
-        if k not in cal: seen.add(k)
-print(len(seen))
-PY
-)"
+COUNT="$("$PY" "$KB_DIR/scripts/gate_dossier.py" count 2>/dev/null)"
+case "$COUNT" in
+  ''|*[!0-9]*)
+    # Never notify off a count we could not compute (import error, broken venv).
+    echo "[gate-accrual] SKIP — could not compute the judgeable count"
+    [ "${1:-}" = "--count-only" ] && echo "?/$TARGET"
+    exit 0 ;;
+esac
 
 if [ "${1:-}" = "--count-only" ]; then
   echo "$COUNT/$TARGET"
   exit 0
 fi
 
-echo "[gate-accrual] fresh HIGH rows: $COUNT / $TARGET"
+echo "[gate-accrual] judgeable gate rows: $COUNT / $TARGET"
 if [ "$COUNT" -ge "$TARGET" ] && [ ! -f "$MARKER" ]; then
-  notify "🎯 KB gate accrual TRIPPED — fresh HIGH rows: ${COUNT} >= ${TARGET}. The ej9 gate set is fully powered: run 'python scripts/gate_dossier.py make' (addendum A4) and start the blind labeling session."
+  notify "🎯 KB gate accrual TRIPPED — judgeable gate rows: ${COUNT} >= ${TARGET}. The ej9 gate set is fully powered: run 'python scripts/gate_dossier.py make' (addendum A4) and start the blind labeling session."
   date -Iseconds > "$MARKER"
   echo "[gate-accrual] notified + marker written"
 fi

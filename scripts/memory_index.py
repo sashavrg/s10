@@ -506,15 +506,20 @@ def _should_rerank(scored: list, tuning: dict) -> bool:
     return gap < float(gap_threshold)
 
 
-def _rerank_tiers(query: str, scored: list, tuning: dict) -> list:
+def _rerank_tiers(query: str, scored: list, tuning: dict) -> tuple[list, bool]:
     """Precision stage: hand the top-K embedding candidates to a local LLM judge
     and let it pick the one that actually answers the query (or none). The winner
     becomes the single HIGH match (moved to rank 0); the rest can only advertise.
-    On any failure the embedding rank-cap is used, so retrieval still works."""
+
+    Returns (tiered, ok). ok=False means the judge CALL failed — timeout or
+    transport — so NO verdict exists: the caller must fall back to the lexical
+    scorer with provenance (Task 9 bounded-fallback invariant, 2026-07-29). A
+    verdict of "none relevant" is ok=True with advertise-only tiering — that is
+    certified rerank semantics, not a failure. The two used to collapse into one
+    branch, which made a timed-out judge indistinguishable from a real verdict."""
     k = int(os.environ.get('KB_RERANK_K', '10'))
     hi, mod = _embed_thresholds('embedding', tuning)
     cands = scored[:k]
-    winner = None
     try:
         import reranker  # noqa: PLC0415
         winner = reranker.rerank(query, [
@@ -522,11 +527,11 @@ def _rerank_tiers(query: str, scored: list, tuning: dict) -> list:
             for _s, _t, e in cands
         ])
     except Exception:
-        winner = None
+        return scored, False             # call failed — no verdict happened
 
     if winner is None:
-        # judge said "none relevant" or failed -> nothing injectable, only advertise
-        return [(s, ('moderate' if s >= mod else 'none'), e) for s, _t, e in scored]
+        # judge VERDICT: none relevant -> nothing injectable, only advertise
+        return [(s, ('moderate' if s >= mod else 'none'), e) for s, _t, e in scored], True
 
     # The judge picks WHICH candidate; embedding's confidence still gates WHETHER it
     # injects. A winner below the HIGH floor is the judge grabbing a weak candidate
@@ -539,7 +544,7 @@ def _rerank_tiers(query: str, scored: list, tuning: dict) -> list:
               for i, (s, _t, e) in enumerate(scored)]
     chosen = tiered.pop(winner)          # surface the judged-best as matches[0]
     tiered.insert(0, chosen)
-    return tiered
+    return tiered, True
 
 
 def retrieve(query: str, project: str | None = None, max_facts: int = 6,
@@ -573,7 +578,24 @@ def retrieve(query: str, project: str | None = None, max_facts: int = 6,
         except Exception:
             mode = 'lexical'                 # ollama down / model missing -> fail safe
 
+    # Version pin for Task 10: the ATTEMPTED config, kept even when the judge call
+    # fails and lexical runs — the row's full story is "attempted rerank-kXfY, fell
+    # back". The facts default mirrors reranker.RERANK_FACTS's ('3'). The judge
+    # MODEL is always part of the string (2026-08-01): new model = new scorer, and
+    # k10f3-on-3B must never masquerade as the 7B's or haiku's certification.
+    # (Rows from the 7B era say bare 'rerank-kXfY' — 7B implicit, append-only.)
+    if mode == 'rerank':
+        import reranker  # noqa: PLC0415 (stdlib-only module)
+        judge = (reranker.RERANK_CLOUD_MODEL_ID
+                 if reranker.rerank_backend() == 'claude'
+                 else os.environ.get('KB_RERANK_MODEL', reranker.RERANK_MODEL))
+        retrieval_config = (f"rerank-k{int(os.environ.get('KB_RERANK_K', '10'))}"
+                            f"f{int(os.environ.get('KB_RERANK_FACTS', '3'))}@{judge}")
+    else:
+        retrieval_config = mode
+
     scored = []
+    lex_scored = []   # rerank mode retains the lexical view for the timeout fallback
     for entry in index['entries']:
         projects = [p.lower() for p in entry.get('projects', [])]
         if projects and proj_norm and proj_norm not in projects:
@@ -586,18 +608,33 @@ def retrieve(query: str, project: str | None = None, max_facts: int = 6,
             emb = max(0.0, er.cosine(qvec, vec)) if vec else 0.0
             # rerank scores on embedding (it just reorders the top-K afterwards)
             s, tier = (emb if mode in ('embedding', 'rerank') else 0.5 * lex + 0.5 * emb), None
+            if mode == 'rerank' and lex > 0:
+                lex_scored.append((lex, tier_for(lex, tuning), entry))
         if s <= 0:
             continue
         scored.append((s, tier, entry))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
+    rerank_timeout = False
     if mode == 'rerank':
         # Ambiguity-gated: only spend the LLM judge when it can change the outcome;
         # otherwise fall through to the cheap embedding rank-cap (rerank scores are
         # cosines, so tier them as 'embedding').
         if _should_rerank(scored, tuning):
-            scored = _rerank_tiers(query, scored, tuning)
+            tiered, ok = _rerank_tiers(query, scored, tuning)
+            if ok:
+                scored = tiered
+            else:
+                # Judge call FAILED (timeout/transport) — no verdict exists. Bounded
+                # fallback (Task 9, 2026-07-29): inject the LEXICAL result instead
+                # and report the scorer that ACTUALLY ran, so no would-inject turn is
+                # dropped and no row misreports its scorer. The injection-log row
+                # carries mode + rerank_timeout as provenance.
+                lex_scored.sort(key=lambda x: x[0], reverse=True)
+                scored = lex_scored
+                mode = 'lexical'
+                rerank_timeout = True
         else:
             scored = _embed_tiers(scored, 'embedding', tuning)
     elif mode != 'lexical':
@@ -619,7 +656,9 @@ def retrieve(query: str, project: str | None = None, max_facts: int = 6,
     return {
         'query': query,
         'project': project,
-        'mode': mode,
+        'mode': mode,                       # the scorer that ACTUALLY produced this
+        'retrieval_config': retrieval_config,   # the ATTEMPTED config (Task 10 pin)
+        'rerank_timeout': rerank_timeout,   # True = judge call failed, lexical ran
         'top_tier': top['tier'] if top else 'none',
         'matches': results,
     }
