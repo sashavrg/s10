@@ -2,7 +2,7 @@
 """Retrieval / injection eval harness for the memory system.
 
 Runs a golden set of (prompt -> expected topic slug(s)) cases through
-memory_index.retrieve() and reports retrieval quality. Scorer-agnostic: it calls
+memory_retrieval.retrieve() and reports retrieval quality. Scorer-agnostic: it calls
 the real retrieve(), so whichever scorer that path uses (lexical today, the
 embedding rescorer behind KB_RETRIEVAL=embedding later) is what gets measured.
 A/B = run under each scorer, then `compare` the two saved result files.
@@ -27,6 +27,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE / 'scripts'))
 import memory_index as mi  # noqa: E402
+import memory_retrieval  # noqa: E402
 
 CASES_DEFAULT = BASE / 'evals' / 'cases.jsonl'
 if not CASES_DEFAULT.exists():  # fresh clone: fall back to the synthetic example set
@@ -59,7 +60,7 @@ def run_cases(cases, k):
         for s in expect:
             if s not in index_slugs:
                 warnings.append(f"{c.get('id', '?')}: expect slug not in index -> {s}")
-        res = mi.retrieve(c['prompt'], project=c.get('project'))
+        res = memory_retrieval.retrieve(c['prompt'], project=c.get('project'))
         matches = res['matches']
         top = matches[0] if matches else None
         rank = first_rank(matches, expect) if expect else None

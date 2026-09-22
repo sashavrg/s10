@@ -36,6 +36,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # nightly pipeline instead of maintaining a second, divergent one.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kb  # noqa: E402
+from transcript_turns import parse_turns as parse_agent_turns  # noqa: E402
 
 RAW_INBOX_DIR = BASE_DIR / 'raw' / 'inbox'
 STATE_DIR = BASE_DIR / 'state'
@@ -106,29 +107,8 @@ def save_harvest_state(state: dict) -> None:
 
 
 def parse_transcript(path: Path) -> list[dict]:
-    """Return [{'role': 'user'|'assistant', 'text': str}, ...] from a Claude Code .jsonl transcript.
-
-    Claude Code stores one JSON object per line. We defensively pull role + text
-    regardless of minor schema drift by checking the common shapes.
-    """
-    turns: list[dict] = []
-    for line in path.read_text(errors='replace').splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        msg = obj.get('message') if isinstance(obj.get('message'), dict) else obj
-        role = msg.get('role') or obj.get('type')
-        if role not in ('user', 'assistant'):
-            continue
-        content = msg.get('content', '')
-        text = _flatten_content(content)
-        if text.strip():
-            turns.append({'role': role, 'text': text.strip()})
-    return turns
+    """Return user/assistant turns from a supported agent transcript JSONL."""
+    return parse_agent_turns(path)
 
 
 def _flatten_content(content) -> str:

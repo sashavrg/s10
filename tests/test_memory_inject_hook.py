@@ -44,7 +44,7 @@ import io
 
 def _drive(monkeypatch, tmp_path, res_or_exc, prompt='real user question about widgets'):
     """Run h.main() with a stubbed retrieve; return the parsed log rows + stdout."""
-    import memory_index as mi
+    import memory_retrieval
     monkeypatch.delenv('KB_HEADLESS', raising=False)
     log = tmp_path / 'memory_injection.jsonl'
     monkeypatch.setattr(h, 'LOG_PATH', log)
@@ -54,7 +54,7 @@ def _drive(monkeypatch, tmp_path, res_or_exc, prompt='real user question about w
     else:
         def stub(q, project=None):
             return res_or_exc
-    monkeypatch.setattr(mi, 'retrieve', stub)
+    monkeypatch.setattr(memory_retrieval, 'retrieve', stub)
     payload = {'prompt': prompt, 'cwd': '/home/u/proj', 'session_id': 'sess-1'}
     monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps(payload)))
     out = io.StringIO()

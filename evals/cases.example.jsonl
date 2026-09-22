@@ -9,7 +9,7 @@
 #            "paraphrase" = same intent, deliberately different wording (the hard case)
 #            "negative"   = prompt that should trigger NO high-tier injection (expect: [])
 #   project  session project tag used to scope retrieval (or null for unscoped prompts)
-#   prompt   the user-prompt text fed to memory_index.retrieve()
+#   prompt   the user-prompt text fed to memory_retrieval.retrieve()
 #   expect   list of topic slugs that SHOULD be retrieved (empty list for negatives)
 #   split    "train" | "val" | "held_out" — may be omitted; run scripts/eval_split.py
 #            to assign splits deterministically (60/20/20, stratified by kind).

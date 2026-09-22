@@ -66,25 +66,25 @@ def test_calibration_burned_group_fully_excluded():
 
 
 AWS_ENTRY = """### 2026-07-20 — memory-injection — HIGH 0.95 on `aws`
-**Log trace:** logs/memory_injection.jsonl ts=2026-01-15T09:00:00, tier=high, score=0.95,
-injected=aws, session ab12cd34.
+**Log trace:** logs/memory_injection.jsonl ts=2026-07-20T11:20:05, tier=high, score=0.95,
+injected=aws, session 037d0c94.
 **Status:** open
 
 ### 2026-07-02 — memory-injection — two HIGH misfires (prose only)
-**Log trace:** logs/memory_injection.jsonl, session of 2026-07-02 (prompts "example prose…").
+**Log trace:** logs/memory_injection.jsonl, session of 2026-07-02 (prompts "Hand-labeling…").
 **Status:** open
 """
 
 
 def test_parse_hooktuning_traces_structured_only():
     traces = ef.parse_hooktuning_traces(AWS_ENTRY)
-    assert traces == [{'ts': '2026-01-15T09:00:00', 'injected': 'aws'}]
+    assert traces == [{'ts': '2026-07-20T11:20:05', 'injected': 'aws'}]
 
 
 def test_hooktuning_autofold_matches_row_and_respects_burn():
     traces = [{'ts': 'tA', 'injected': 'aws'}, {'ts': 'tB', 'injected': 'x'}]
     inj = [{'session_id': 'sA', 'ts': 'tA', 'tier': 'high', 'injected': 'aws',
-            'project': 's10', 'prompt_head': 'what aws the deploy status'},
+            'project': 's10', 'prompt_head': 'what aws the next task'},
            {'session_id': 'sB', 'ts': 'tB', 'tier': 'high', 'injected': 'x',
             'project': 's10', 'prompt_head': 'p'}]
     auto, burned = ef.hooktuning_autofold(traces, inj, burn_keys={('sA', 'tA')})
@@ -124,10 +124,13 @@ def test_mine_moderate_positive_needs_both_proxies():
     assert [c for c in cands if c['src']['session_id'] == 's2'] == []
 
 
-def test_mine_none_skipped_are_negative_candidates():
-    inj = [_inj('s1', 't1', 'none'), _inj('s2', 't2', 'skipped')]
+def test_mine_none_negative_but_skips_synthetic_and_skipped():
+    inj = [_inj('s1', 't1', 'none'), _inj('s2', 't2', 'skipped'),
+           _inj('s3', 't3', 'none', head='<task-notification>complete'),
+           _inj('', 't4', 'high', head=' <system-reminder>automated', injected='a')]
     cands = ef.mine_candidates(inj, [], [], set(), set())
-    assert all(c['expect_proposed'] == [] for c in cands) and len(cands) == 2
+    assert len(cands) == 1 and cands[0]['src']['session_id'] == 's1'
+    assert cands[0]['expect_proposed'] == []
 
 
 def test_mine_sessionless_high_flagged_hide_score():
@@ -317,3 +320,133 @@ def test_build_burn_keys_includes_injection_log_high_without_outcome():
            {'session_id': 'sC', 'ts': 'tC', 'tier': 'high', 'injected': 'cal'}]
     burn = ef.build_burn_keys([], [], {('sC', 'tC', 'cal')}, inj_rows=inj)
     assert burn == {('s9', 't9')}
+
+
+@pytest.fixture
+def reviewed_env(tmp_path, monkeypatch):
+    import memory_index as mi
+    for name in ('CASES_PATH', 'INJECTION_LOG_PATH', 'V1_PATH', 'V2_PATH',
+                 'CAL_PATH', 'AUTO_STAGE_PATH', 'REVIEW_PATH'):
+        path = tmp_path / name
+        path.write_text('')
+        monkeypatch.setattr(ef, name, path)
+    monkeypatch.setattr(mi, 'load_index', lambda: {'entries': [{'slug': 'slug-a'}]})
+    ef.INJECTION_LOG_PATH.write_text('\n'.join(json.dumps(_inj('s1', ts, 'none'))
+                                              for ts in ('t1', 't2')))
+    return {'id': ef.candidate_id('s1', 't1'), 'src': {'session_id': 's1', 'ts': 't1'},
+            'project': 'p', 'prompt': 'exact reviewed prompt', 'expect': ['slug-a'],
+            'kind': 'paraphrase', 'provenance': 'agent-review',
+            'operator_attested': False, 'reviewer': 'assistant',
+            'reason': 'Useful constraint', 'basis': 'Current snapshot relevance'}
+
+
+def test_reviewed_promotion_preserves_evidence_and_session_split(reviewed_env):
+    row = reviewed_env
+    old = {'id': 'old', 'src': {'session_id': 's1'}, 'split': 'val'}
+    before = '# retained verbatim\n' + json.dumps(old) + '\n'
+    ef.CASES_PATH.write_text(before)
+    ef.AUTO_STAGE_PATH.write_text('unrelated auto-stage')
+    ef.REVIEW_PATH.write_text('unrelated checklist')
+    operator = {**row, 'id': ef.candidate_id('s1', 't2'),
+                'src': {'session_id': 's1', 'ts': 't2'},
+                'provenance': 'operator-reviewed', 'operator_attested': True,
+                'reviewer': 'operator',
+                'operator_adjudication': {'saw_assistant_recommendation': True}}
+    assert ef.fold_reviewed([row, operator])['folded'] == 2
+    data = ef._read_jsonl(ef.CASES_PATH)
+    assert ef.CASES_PATH.read_text().startswith(before)
+    assert data[1] == {**row, 'split': 'val'}
+    assert data[2] == {**operator, 'split': 'val'}
+    assert ef.AUTO_STAGE_PATH.read_text() == 'unrelated auto-stage'
+    assert ef.REVIEW_PATH.read_text() == 'unrelated checklist'
+    text = ef.CASES_PATH.read_text()
+    assert ef.fold_reviewed([row, operator]) == {'folded': 0, 'already_present': 2}
+    assert ef.CASES_PATH.read_text() == text
+    with pytest.raises(ValueError, match='conflicting'):
+        ef.fold_reviewed([{**row, 'expect': []}])
+
+
+@pytest.mark.parametrize('problem', ['burned', 'missing', 'held_out', 'attestation',
+                                    'unknown_slug', 'bad_kind', 'synthetic', 'bad_id'])
+def test_reviewed_promotion_rejects_invalid_batch_without_writes(reviewed_env, problem):
+    row = reviewed_env
+    bad = {**row, 'id': ef.candidate_id('s1', 't2'),
+           'src': {'session_id': 's1', 'ts': 't2'}}
+    if problem == 'burned':
+        ef.V1_PATH.write_text(json.dumps(_out('s1', 't2', 'slug-a', 'high', True)))
+    elif problem == 'missing':
+        ef.INJECTION_LOG_PATH.write_text(json.dumps(_inj('s1', 't1', 'none')))
+    elif problem == 'held_out':
+        ef.CASES_PATH.write_text(json.dumps({'id': 'old', 'src': {'session_id': 's1'},
+                                           'split': 'held_out'}) + '\n')
+    elif problem == 'attestation':
+        bad['operator_attested'] = True
+    elif problem == 'unknown_slug':
+        bad['expect'] = ['unknown']
+    elif problem == 'bad_kind':
+        bad['kind'] = 'negative'
+    elif problem == 'synthetic':
+        bad['prompt'] = '<task-notification>done'
+    else:
+        bad['id'] = 'arbitrary'
+    before = ef.CASES_PATH.read_text()
+    with pytest.raises(ValueError):
+        ef.fold_reviewed([row, bad])
+    assert ef.CASES_PATH.read_text() == before
+
+
+def test_reviewed_new_sessions_never_enter_held_out(reviewed_env):
+    rows = [{**reviewed_env, 'id': ef.candidate_id(f's{i}', 't1'),
+             'src': {'session_id': f's{i}', 'ts': 't1'}} for i in range(30)]
+    ef.INJECTION_LOG_PATH.write_text('\n'.join(
+        json.dumps(_inj(f's{i}', 't1', 'none')) for i in range(30)))
+    ef.fold_reviewed(rows)
+    assert {c['split'] for c in ef._read_jsonl(ef.CASES_PATH)} == {'train', 'val'}
+
+
+def test_select_batch_prioritizes_positives_deterministically():
+    rows = [_cand('s1', 't1', 'negative', []),
+            _cand('s2', 't2', 'positive', ['a']),
+            _cand('s3', 't3', 'positive too', ['b'])]
+    batch = ef.select_batch(rows, 2)
+    assert all(c['expect_proposed'] for c in batch)
+    assert batch == ef.select_batch(list(reversed(rows)), 2)
+
+
+def test_reviewed_input_is_strict(tmp_path):
+    path = tmp_path / 'missing.jsonl'
+    with pytest.raises(FileNotFoundError):
+        ef.read_reviewed(path)
+    path.write_text('{malformed}\n')
+    with pytest.raises(json.JSONDecodeError):
+        ef.read_reviewed(path)
+
+
+def test_mine_cli_excludes_review_history_and_heldout(reviewed_env, monkeypatch, tmp_path):
+    import sys
+    history = tmp_path / 'reviewed.jsonl'
+    history.write_text(json.dumps(reviewed_env))
+    ef.CASES_PATH.write_text(json.dumps({'id': 'old', 'split': 'held_out',
+                                       'src': {'session_id': 'held'}}))
+    ef.INJECTION_LOG_PATH.write_text('\n'.join(json.dumps(r) for r in [
+        _inj('s1', 't1', 'none'), _inj('s1', 't2', 'none', head='fresh negative'),
+        _inj('held', 't3', 'none', head='heldout prompt'),
+        _inj('s4', 't4', 'none', head='<task-notification>done')]))
+    monkeypatch.setattr(ef, 'HOOKTUNING_PATH', tmp_path / 'absent')
+    monkeypatch.setattr(ef, 'recover_prompt', lambda r: (r['prompt_head'], True))
+    monkeypatch.setattr(sys, 'argv', ['eval_foldin.py', 'mine', '--review-history',
+                                    str(history), '--batch-size', '2'])
+    ef.main()
+    md = ef.REVIEW_PATH.read_text()
+    assert 'fresh negative' in md
+    assert ef.candidate_id('s1', 't1') not in md
+    assert 'heldout prompt' not in md and '<task-notification>' not in md
+
+
+def test_legacy_fold_keeps_reviewed_session_in_existing_split(reviewed_env, monkeypatch):
+    ef.CASES_PATH.write_text(json.dumps({**reviewed_env, 'split': 'val'}) + '\n')
+    monkeypatch.setattr(ef, 'recover_prompt', lambda r: ('another prompt', False))
+    monkeypatch.setattr(ef, 'assign_fold_split', lambda r: 'held_out')
+    ef.fold([{'src': {'session_id': 's1', 'ts': 't2'}, 'expect': [],
+              'keep': True, 'kind': 'negative'}])
+    assert [c['split'] for c in ef._read_jsonl(ef.CASES_PATH)] == ['val', 'val']

@@ -197,11 +197,12 @@ def main() -> None:
 
     try:
         import memory_index as mi
+        import memory_retrieval
     except Exception:
         return
 
     try:
-        res = mi.retrieve(prompt, project=project)
+        res = memory_retrieval.retrieve(prompt, project=project)
     except Exception as e:
         # No-dropped-row invariant (Task 9): fail-open on the TURN (inject nothing)
         # but never on the LOG — a vanished row is the silent-attrition class that

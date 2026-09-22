@@ -150,22 +150,48 @@ fi
 
 # Cloud backend selection. Nightly default routes summaries to Sonnet and topic
 # pages to Opus (separate quota pools on this plan), with the resolved local
-# models as per-item fallback. Requires the `claude` binary and a long-lived
-# CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`, stored in .env). If either
-# is missing we degrade to local-only rather than firing a fallback per item.
-# Override the specs with KB_SUMMARY_SPEC / KB_TOPIC_SPEC (e.g. to force local).
-if command -v claude >/dev/null 2>&1 && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+# models as per-item fallback. Requires the `claude` binary and a login that can
+# actually complete a call; if not we degrade to local-only rather than firing a
+# fallback per item. Override with KB_SUMMARY_SPEC / KB_TOPIC_SPEC (force local).
+#
+# The precondition is deliberately a live PROBE, not the presence of a credential.
+# Until 2026-09-09 this tested `-n $CLAUDE_CODE_OAUTH_TOKEN`, which is exactly the
+# check that could not catch the 09-05..09 outage: the token was present and
+# authenticated fine, but its org had Claude Code switched off, so the guard said
+# "cloud enabled" and every single item then failed and fell back, all night, for
+# four nights. Credential-present != entitled. One cheap call up front collapses
+# that into a single accurate notice naming the real reason.
+CLOUD_OK=0
+CLOUD_WHY=""
+if ! command -v claude >/dev/null 2>&1; then
+  CLOUD_WHY="'claude' binary not on PATH"
+else
+  # Neutral cwd + KB_HEADLESS=1 + scrubbed API key, matching claude_code_payload()
+  # in kb.py: no repo CLAUDE.md/skills auto-load, no hook re-entry, subscription
+  # OAuth rather than a key.
+  CLOUD_PROBE=$( (cd "${TMPDIR:-/tmp}" && printf 'Reply with the single word: ok' \
+    | KB_HEADLESS=1 timeout 120 env -u ANTHROPIC_API_KEY \
+      claude -p --model "${KB_PROBE_MODEL:-sonnet}" --output-format json) 2>&1 ) || true
+  CLOUD_WHY=$(printf '%s' "$CLOUD_PROBE" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print('claude probe returned no usable JSON'); raise SystemExit
+if d.get('is_error') or not (d.get('result') or '').strip():
+    print((d.get('result') or 'claude probe failed').strip()[:200])
+" 2>/dev/null || echo 'claude probe could not be evaluated')
+  [ -z "$CLOUD_WHY" ] && CLOUD_OK=1
+fi
+
+if [ "$CLOUD_OK" = "1" ]; then
   SUMMARY_SPEC="${KB_SUMMARY_SPEC:-claude:sonnet}"
   TOPIC_SPEC="${KB_TOPIC_SPEC:-claude:opus}"
   log "Cloud backend enabled (summary: $SUMMARY_SPEC, topic: $TOPIC_SPEC; local fallback summary: $SUMMARY_MODEL, topic: $TOPIC_MODEL)"
 else
-  # Name exactly which precondition is missing so the failure is self-explaining
-  # (the previous lumped message made this hard to diagnose from logs alone).
-  MISSING=""
-  command -v claude >/dev/null 2>&1 || MISSING="'claude' binary not on PATH"
-  if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    MISSING="${MISSING:+$MISSING; }CLAUDE_CODE_OAUTH_TOKEN unset (add it to .env)"
-  fi
+  # CLOUD_WHY carries the probe's own words (e.g. the org-entitlement refusal),
+  # so the notice names the actual cause instead of a generic precondition.
+  MISSING="$CLOUD_WHY"
   SUMMARY_SPEC="${KB_SUMMARY_SPEC:-$SUMMARY_MODEL}"
   TOPIC_SPEC="${KB_TOPIC_SPEC:-$TOPIC_MODEL}"
   log "WARN: cloud backend unavailable ($MISSING) — running local-only"
@@ -201,14 +227,63 @@ if [ "$PIPELINE_RC" -ne 0 ]; then
   log "ERROR: $PIPELINE_ERROR — continuing with bookkeeping/sync"
   MSG="KB pipeline FAILED ($PIPELINE_ERROR) — see logs/pipeline.log"
 else
-  INGESTED=$(echo "$OUTPUT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('ingested_from_inbox',[])))" 2>/dev/null || echo "?")
-  SUMMARIZED=$(echo "$OUTPUT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('summarized',[])))" 2>/dev/null || echo "?")
-  REBUILT=$(echo "$OUTPUT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rebuilt_topics',[])))" 2>/dev/null || echo "?")
+  # kb.py's run summary is the LAST JSON object on stdout — but stdout is captured
+  # with 2>&1 and kb.py prints "WARN: <item> ..." lines for per-item failures, so
+  # on any run with a warning json.loads() raised and all three counts collapsed to
+  # "?" via the old `|| echo "?"`. That is what produced four consecutive nights of
+  # "inbox: ? new, summaries: ? updated, topics rebuilt: ?" (2026-09-05..09) while
+  # the real story was that every backend was failing. Parse once, and recover the
+  # trailing object if anything at all precedes it.
+  COUNTS=$(printf '%s' "$OUTPUT" | python3 -c "
+import json, sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except json.JSONDecodeError:
+    start = raw.rfind(chr(10) + '{')
+    if start == -1:
+        raise
+    d = json.loads(raw[start + 1:])
+print(len(d.get('ingested_from_inbox', [])))
+print(len(d.get('summarized', [])))
+print(len(d.get('rebuilt_topics', [])))
+" 2>/dev/null) || COUNTS=""
 
-  if [ "$INGESTED" = "0" ] && [ "$SUMMARIZED" = "0" ] && [ "$REBUILT" = "0" ]; then
+  if [ -z "$COUNTS" ]; then
+    INGESTED="?"; SUMMARIZED="?"; REBUILT="?"
+  else
+    INGESTED=$(printf '%s\n' "$COUNTS" | sed -n 1p)
+    SUMMARIZED=$(printf '%s\n' "$COUNTS" | sed -n 2p)
+    REBUILT=$(printf '%s\n' "$COUNTS" | sed -n 3p)
+  fi
+
+  # Work the run was supposed to do but did not. A healthy run ends at 0; anything
+  # above means items carry needs_summary/needs_topic_rebuild into tomorrow, which
+  # is what separates a real "done" from a cheerful message over a pipeline that
+  # produced nothing.
+  PENDING=$(python3 -c "
+import json
+m = json.load(open('state/manifest.json'))
+def vals(x): return list(x.values()) if isinstance(x, dict) else (x or [])
+# BOTH flags live on SOURCE records (kb.py rebuild_affected_topics / topic backlog);
+# topic entries carry no needs_* key, so counting them there always yielded 0.
+print(sum(1 for v in vals(m.get('sources'))
+          if v.get('needs_summary') or v.get('needs_topic_rebuild')))
+" 2>/dev/null) || PENDING=""
+  case "$PENDING" in ''|*[!0-9]*) PENDING=0 ;; esac
+
+  if [ -z "$COUNTS" ]; then
+    # Unparseable output is itself a fault, not a success worth reporting as one.
+    MSG="⚠️ KB pipeline finished but its output could not be parsed — see logs/pipeline.log"
+  elif [ "$INGESTED" = "0" ] && [ "$SUMMARIZED" = "0" ] && [ "$REBUILT" = "0" ] && [ "$PENDING" -eq 0 ]; then
     MSG="KB pipeline ran — nothing changed."
+  elif [ "$SUMMARIZED" = "0" ] && [ "$REBUILT" = "0" ] && [ "$PENDING" -gt 0 ]; then
+    # No LLM output at all while work remains queued: every backend failed for
+    # every item. This is exactly the case that used to report "done".
+    MSG="⚠️ KB pipeline STALLED — ingested $INGESTED, produced 0 summaries and 0 topic pages; $PENDING item(s) still queued (all LLM backends failed?) — see logs/pipeline.log"
   else
     MSG="KB pipeline done — inbox: $INGESTED new, summaries: $SUMMARIZED updated, topics rebuilt: $REBUILT."
+    [ "$PENDING" -gt 0 ] && MSG="$MSG ⚠️ $PENDING still queued."
   fi
 fi
 log "$MSG"

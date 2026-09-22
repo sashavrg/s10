@@ -263,11 +263,144 @@ def test_window_open_date_prefers_env_then_marker_then_none(tmp_path, monkeypatc
     assert sc.window_open_date() == '2026-09-09'  # env overrides for dry runs
 
 
-def test_window_count_must_not_depend_on_rescore_freshness():
-    """The tripwire counts ACCRUAL; the live log is the accrual record. The
-    rescored analysis file lags (it refreshes only when upkeep runs), and a
-    stale-file count silently under-reads the window — observed 2026-08-10:
-    rescored said 0/40 while the live log held 19/40."""
-    import inspect
-    src = inspect.getsource(sc.main)
-    assert 'OUTCOME_PATH' in src.split('window_count')[1].split('return')[0]
+import json
+import sys
+
+import pytest
+
+
+def _judged(row, version='ej-test'):
+    return {**row, 'scorer_version': 3, 'judge_version': version,
+            'engaged_in_assistant': True, 'topic_corrected': False}
+
+
+def test_depth_survives_window_tier_and_judge_selection():
+    history = [_o('old', 'a', '2026-07-01', tier='moderate'),
+               _o('new', 'a', '2026-08-05'),
+               _o('other', 'a', '2026-08-06', project='different'),
+               _o('later', 'a', '2026-09-01')]
+    judged = [_judged(r) for r in history]
+    judged[0]['judge_version'] = 'old-judge'
+    card = sc.scorecard(judged, history=history, window_start='2026-08-01',
+                        window_end='2026-09-01', judge_version='ej-test')
+    high = card['by_tier']['high']
+    assert high['n'] == 2
+    assert high['correctness_on_seen']['repeat_injects'] == 1
+    assert [(b['bucket'], b['n']) for b in high['compounding_curve']] == [('0', 1), ('1-3', 1)]
+    assert card['coverage']['high_repeat_eligible'] == sc.window_progress(
+        history, '2026-08-01', '2026-09-01')['n'] == 1
+
+
+def test_enriched_helper_input_does_not_lose_pre_window_history():
+    rows = sc.enrich_depth([_judged(_o('a', 'x', '2026-07-01')),
+                            _judged(_o('b', 'x', '2026-08-01'))])
+    selected = rows[1:]
+    assert sc.compounding_curve(selected)[0]['bucket'] == '1-3'
+    assert sc.correctness_on_seen(selected)['repeat_injects'] == 1
+    assert sc.scorecard(selected)['by_tier']['high']['compounding_curve'][0]['bucket'] == '1-3'
+    with pytest.raises(ValueError, match='Mixed raw'):
+        sc.compounding_curve([rows[0], _o('c', 'x', '2026-09-01')])
+
+
+def test_duplicate_log_writes_do_not_inflate_accrual_or_useful_counts():
+    first = _judged(_o('a', 'x', '2026-07-01'))
+    second = _judged(_o('b', 'x', '2026-08-01'))
+    rows = [first, second, first, second]
+    assert sc.window_progress(rows, '2026-08-01')['n'] == 1
+    card = sc.scorecard(rows, window_start='2026-08-01')
+    assert card['n_outcomes'] == card['by_tier']['high']['useful'] == 1
+    assert card['coverage']['duplicate_analysis_rows'] == 2
+    assert card['coverage']['duplicate_history_rows'] == 2
+
+
+def test_reconstructed_analysis_event_cannot_change_tripwire_depth():
+    # The real 37/38 discrepancy class: analysis has a prior exposure absent
+    # from the live log. Re-judging cannot retroactively move the exit counter.
+    live = [_o('later', 'hermes', '2026-08-26')]
+    analysis = [_judged(_o('earlier', 'hermes', '2026-08-24')), _judged(live[0])]
+    card = sc.scorecard(analysis, history=live, window_start='2026-08-05')
+    assert card['coverage']['analysis_only'] == 1
+    assert card['coverage']['high_repeat_eligible'] == 0
+    assert card['by_tier']['high']['correctness_on_seen']['repeat_injects'] == 0
+    assert card['by_tier']['high']['compounding_curve'][0]['bucket'] == '0'
+
+
+def test_missing_or_mismatched_judgments_are_visible_coverage_gaps():
+    live = [_o('first', 'x', '2026-07-01'), _o('again', 'x', '2026-08-01'),
+            _o('third', 'x', '2026-08-02')]
+    analysis = [_judged(live[1], 'old-judge'), _judged({**live[2], 'project': 'wrong'})]
+    card = sc.scorecard(analysis, history=live, window_start='2026-08-01', judge_version='ej-test')
+    assert card['n_outcomes'] == 0
+    assert card['coverage']['high_repeat_eligible'] == 2
+    assert card['coverage']['high_repeat_unjudged'] == 2
+    assert card['coverage']['metadata_mismatch'] == 1
+    assert card['repeat_injection_lift']['lift'] is None
+
+
+def test_repeat_lift_is_distinct_from_all_depth_lift():
+    rows = [_judged(_o('h0', 'h', '2026-07-01')),
+            {**_judged(_o('h1', 'h', '2026-08-01')), 'engaged_in_assistant': False},
+            {**_judged(_o('m0', 'm', '2026-07-01', tier='moderate')), 'engaged_in_assistant': False},
+            _judged(_o('m1', 'm', '2026-08-01', tier='moderate'))]
+    card = sc.scorecard(rows)
+    assert card['injection_lift']['lift'] == 0
+    assert card['repeat_injection_lift']['lift'] == -1
+    assert card['repeat_injection_lift']['high_ci'] is not None
+
+
+@pytest.fixture
+def cli_logs(tmp_path, monkeypatch):
+    live = tmp_path / 'live.jsonl'
+    rescored = tmp_path / 'rescored.jsonl'
+    rows = [_o('first', 'a', '2026-07-01T12:00:00'),
+            _o('again', 'a', '2026-08-05T12:00:00')]
+    live.write_text('\n'.join(json.dumps(r) for r in rows))
+    # Stale analysis log, only pre-window data.
+    rescored.write_text(json.dumps(_judged(rows[0])))
+    monkeypatch.setattr(sc, 'OUTCOME_PATH', live)
+    monkeypatch.setattr(sc, 'RESCORED_PATH', rescored)
+    monkeypatch.setattr(sc, 'WINDOW_MARKER', tmp_path / 'absent-marker')
+    monkeypatch.setenv('KB_WINDOW_OPEN', '2026-08-01')
+    return live, rescored, rows
+
+
+def test_window_count_uses_live_but_honors_explicit_default_log(cli_logs, monkeypatch, capsys):
+    live, rescored, _ = cli_logs
+    monkeypatch.setattr(sys, 'argv', ['scorecard', '--window-count'])
+    sc.main()
+    assert capsys.readouterr().out.strip() == '1'
+    # Previously this explicit path was mistaken for an omitted --log.
+    monkeypatch.setattr(sys, 'argv', ['scorecard', '--window-count', '--log', str(rescored)])
+    sc.main()
+    assert capsys.readouterr().out.strip() == '0'
+    monkeypatch.setattr(sys, 'argv', ['scorecard', '--window-count', '--log', str(rescored),
+                                    '--history-log', str(live)])
+    sc.main()
+    assert capsys.readouterr().out.strip() == '1'
+
+
+def test_cli_window_pins_judge_and_reports_pending_coverage(cli_logs, monkeypatch, capsys):
+    live, rescored, rows = cli_logs
+    rescored.write_text('\n'.join(json.dumps(_judged(r, 'old-judge' if i else 'ej-test'))
+                                  for i, r in enumerate(rows)))
+    monkeypatch.setattr(sys, 'argv', ['scorecard', '--window', '2026-08-01', '--until', '2026-09-01',
+                                    '--judge-version', 'ej-test', '--json'])
+    sc.main()
+    card = json.loads(capsys.readouterr().out)
+    assert card['n_outcomes'] == 0
+    assert card['coverage']['high_repeat_eligible'] == 1
+    assert card['coverage']['high_repeat_unjudged'] == 1
+    assert card['recall']['available'] is False
+    assert 'window-scoped' in card['recall']['needs']
+
+
+@pytest.mark.parametrize('bounds', [
+    ['--window', 'garbage'], ['--window', '2026-02-30'],
+    ['--window', '2026-08-01', '--until', '2026-07-01'],
+    ['--window', '2026-08-01T00:00:00+02:00'],
+])
+def test_cli_rejects_invalid_window_bounds(cli_logs, monkeypatch, bounds):
+    monkeypatch.setattr(sys, 'argv', ['scorecard', *bounds])
+    with pytest.raises(SystemExit) as exc:
+        sc.main()
+    assert exc.value.code == 2

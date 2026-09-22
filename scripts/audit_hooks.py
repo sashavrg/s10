@@ -154,25 +154,30 @@ def decide(stats: dict, tuning: dict, ostats: dict | None = None) -> dict:
 
     add_block = sorted(set(add_block))
 
-    # Real-traffic outcome demotion — REVERSIBLE by construction (gate 2). Demote a
-    # slug that was injected HIGH >= min_samples times in the rolling window with
-    # ZERO USEFUL outcomes (useful = engaged AND NOT corrected; gate 3 — a seductive-
-    # wrong inject that got corrected does NOT earn a spare). Goes to the SEPARATE
-    # `outcome_demoted` set, which apply_actions REWRITES each run; once a demoted
-    # slug's misfires age out of the window it stops being recomputed in -> it is
-    # re-trialed. No one-way latch (contrast `high_ineligible`, which stays permanent
-    # for manual catch-alls + synthetic-proven false-firers).
-    outcome_demoted: list[str] = []
+    # Real-traffic outcome demotion — REVERSIBLE, but by a HUMAN (gate 2 as amended
+    # 2026-09-20, tune-merge plan (a)). Demote a slug that was injected HIGH >=
+    # min_samples times in the rolling window with ZERO USEFUL outcomes (useful =
+    # engaged AND NOT corrected; gate 3 — a seductive-wrong inject that got corrected
+    # does NOT earn a spare). The proposal is the UNION of the current `outcome_demoted`
+    # set and the freshly-derived one: this auditor only ever ADDS. A current demotion
+    # whose evidence has aged out of the window is NOT dropped — it is reported in
+    # `aged_out` and as a "consider undemoting" suggestion, because removals are
+    # loosenings and loosenings are forever-human (the Stage-1 gate would otherwise
+    # hold every post-merge proposal on the decay alone). Contrast `high_ineligible`,
+    # permanent for manual catch-alls + synthetic-proven false-firers.
+    current_demoted = set(tuning.get('outcome_demoted') or [])
+    fresh: list[str] = []
     outcome_reasons: dict[str, str] = {}
-    if ostats:
-        for s, d in sorted(ostats.get('outcome_slug', {}).items()):
-            non_useful = d['high'] - d['useful']
-            if d['useful'] == 0 and non_useful >= at['min_samples'] and s not in blocked:
-                outcome_demoted.append(s)
-                outcome_reasons[s] = (
-                    f"injected HIGH {d['high']}x on real prompts, 0 useful"
-                    + (f" ({d['harmful']} engaged-but-corrected)" if d['harmful'] else ''))
-    outcome_demoted = sorted(set(outcome_demoted))
+    slug_stats = ostats.get('outcome_slug', {}) if ostats else {}
+    for s, d in sorted(slug_stats.items()):
+        non_useful = d['high'] - d['useful']
+        if d['useful'] == 0 and non_useful >= at['min_samples'] and s not in blocked:
+            fresh.append(s)
+            outcome_reasons[s] = (
+                f"injected HIGH {d['high']}x on real prompts, 0 useful"
+                + (f" ({d['harmful']} engaged-but-corrected)" if d['harmful'] else ''))
+    outcome_demoted = sorted(current_demoted | set(fresh))
+    aged_out = sorted(current_demoted - set(fresh))
 
     new_high = None
     cur_high = tuning['thresholds']['high']
@@ -192,8 +197,14 @@ def decide(stats: dict, tuning: dict, ostats: dict | None = None) -> dict:
         f">= {at['cross_project_min']} projects — consider narrowing its `projects`."
         for s in stats['promiscuous']
     ]
+    for s in aged_out:
+        d = slug_stats.get(s, {'high': 0, 'useful': 0})
+        suggestions.append(
+            f"consider undemoting '{s}' — its real-traffic evidence has aged out of the "
+            f"{at['window_days']}-day window (real HIGH {d['high']}x, useful {d['useful']}); "
+            f"removals are human-only.")
     return {'add_block': add_block, 'outcome_demoted': outcome_demoted,
-            'new_high': new_high, 'suggestions': suggestions,
+            'aged_out': aged_out, 'new_high': new_high, 'suggestions': suggestions,
             'outcome_reasons': outcome_reasons}
 
 
@@ -286,13 +297,18 @@ def apply_actions(actions: dict, tuning_text: str) -> tuple[str, list[str]]:
         if new != text:
             changes.append(f"blocklist += {slug}")
             text = new
-    # Reversible outcome demotions: REWRITE the whole set each run (decay built in).
+    # Outcome demotions: ADD-ONLY. decide() hands us the union with the current set;
+    # write it only when there is something new, and report just the additions —
+    # a removal can never originate here (human-only, see decide()).
     if 'outcome_demoted' in actions:
-        demoted = actions['outcome_demoted']
-        new = replace_list_section(text, 'outcome_demoted', demoted)
-        if new != text:
-            changes.append(f"outcome_demoted := [{', '.join(demoted) or '∅'}]")
-            text = new
+        existing = mi._parse_tuning_yaml(text).get('outcome_demoted') or []
+        added = [s for s in actions['outcome_demoted'] if s not in existing]
+        if added:
+            demoted = sorted(set(existing) | set(added))
+            new = replace_list_section(text, 'outcome_demoted', demoted)
+            if new != text:
+                changes.append(f"outcome_demoted += {', '.join(added)}")
+                text = new
     if actions.get('new_high') is not None:
         text = set_nested_scalar(text, 'thresholds', 'high', actions['new_high'])
         changes.append(f"thresholds.high -> {actions['new_high']}")
@@ -390,10 +406,20 @@ def run(now: dt.datetime, dry_run: bool = False) -> dict:
     tuning_text = TUNING_PATH.read_text() if TUNING_PATH.exists() else ''
     new_text, changes = apply_actions(actions, tuning_text)
     suggestions = actions['suggestions']
-    changed = bool(changes or suggestions)
+    # Only a config CHANGE is a proposal. Suggestions alone (promiscuity re-scopes,
+    # aged-out demotions awaiting a human) are reported, never branched: a branch
+    # with nothing but an audit note has nothing to adjudicate, and a standing
+    # suggestion would otherwise cut one every night.
+    changed = bool(changes)
 
     summary = {'changed': changed, 'changes': changes, 'suggestions': suggestions,
                'stats': stats, 'branch': None, 'pushed': None}
+    if changes:
+        # Stage-1 shadow merge-judge (docs/feedback-loop.md): a
+        # deterministic verdict on THIS proposal, recorded against the branch name the
+        # commit below would use. Recorded, never acted on — the human still merges.
+        # Fail-open like everything else here: the gate can never break the nightly.
+        summary['gate'] = _shadow_gate(tuning_text, new_text, now, record=not dry_run)
     if not changed or dry_run:
         return summary
 
@@ -405,10 +431,29 @@ def run(now: dt.datetime, dry_run: bool = False) -> dict:
 
     date = now.strftime('%Y-%m-%d')
     section = render_audit_section(date, stats, changes, suggestions)
-    msg = f"auto-tune {date}: " + ('; '.join(changes) if changes else 'suggestions only')
+    msg = f"auto-tune {date}: " + '; '.join(changes)
     branch, pushed = _commit_to_branch(date, msg, new_text, tuning_text, section)
     summary['branch'], summary['pushed'] = branch, pushed
     return summary
+
+
+def _shadow_gate(tuning_text: str, new_text: str, now: dt.datetime, record: bool) -> dict:
+    branch = f"auto-tune/{now.strftime('%Y-%m-%d')}"
+    try:
+        import tune_gate                      # lazy: tune_gate imports this module
+        return tune_gate.run_gate(tuning_text, new_text, branch=branch, now=now, record=record)
+    except Exception as e:
+        return {'verdict': 'error', 'reasons': [str(e)], 'branch': branch, 'changes': [],
+                'evaluation': None, 'evidence': None}
+
+
+def gate_brief(gate: dict | None) -> str:
+    if not gate:
+        return ''
+    if gate.get('verdict') == 'error':
+        return f"gate: error ({'; '.join(gate.get('reasons') or [])})"
+    import tune_gate
+    return 'gate: ' + tune_gate.brief(gate)
 
 
 def main() -> None:
@@ -430,11 +475,15 @@ def main() -> None:
         print("audit_hooks: skipped — uncommitted tracked changes in the working tree")
         return
     if not res['changed']:
-        print("audit_hooks: no action")
+        sugg = res.get('suggestions') or []
+        tail = f" ({len(sugg)} standing suggestion(s): " + ' | '.join(sugg) + ')' if sugg else ''
+        print("audit_hooks: no action" + tail)
         return
     where = 'DRY-RUN (no commit)' if args.dry_run else f"branch {res.get('branch')}"
     bits = (res['changes'] + [f"+{len(res['suggestions'])} suggestion(s)"]) if res['suggestions'] else res['changes']
-    print(f"audit_hooks: {where} — " + ('; '.join(bits) if bits else 'changes staged'))
+    line = f"audit_hooks: {where} — " + ('; '.join(bits) if bits else 'changes staged')
+    gb = gate_brief(res.get('gate'))
+    print(line + (f" | {gb}" if gb else ''))
 
 
 if __name__ == '__main__':

@@ -127,8 +127,8 @@ def load_sessions_with_corrections(state_path: Path | str = HARVEST_STATE_PATH,
 
 def _live_retrieve(text: str, project: str | None):
     """Bridge to the live retriever (imported lazily so unit tests stay index-free)."""
-    import memory_index
-    return memory_index.retrieve(text, project=project)
+    import memory_retrieval
+    return memory_retrieval.retrieve(text, project=project)
 
 
 def compute(retrieve_fn=_live_retrieve) -> list[dict]:

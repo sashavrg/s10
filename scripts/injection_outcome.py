@@ -47,6 +47,7 @@ from pathlib import Path
 
 import outcome_matching
 from outcome_matching import tokenize, slug_tokens  # re-export (v1 compat; tests use these)
+from transcript_turns import parse_turns as parse_agent_turns
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 LOG_PATH = BASE_DIR / 'logs' / 'memory_injection.jsonl'
@@ -87,27 +88,8 @@ def _flatten_content(content) -> str:
 
 
 def parse_turns(transcript_path: Path) -> list[dict]:
-    """[{'role','text'}] from a Claude Code .jsonl transcript (mirrors harvest_session)."""
-    turns: list[dict] = []
-    p = Path(transcript_path)
-    if not p.exists():
-        return turns
-    for line in p.read_text(errors='replace').splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        msg = obj.get('message') if isinstance(obj.get('message'), dict) else obj
-        role = msg.get('role') or obj.get('type')
-        if role not in ('user', 'assistant'):
-            continue
-        text = _flatten_content(msg.get('content', ''))
-        if text.strip():
-            turns.append({'role': role, 'text': text})
-    return turns
+    """Return user/assistant turns from a supported agent transcript JSONL."""
+    return parse_agent_turns(Path(transcript_path))
 
 
 def correction_text_for_session(session_id: str,

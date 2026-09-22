@@ -32,15 +32,11 @@ from components.** Keep it current when you change the loop.
                                       rerank is warm — semantics-preserving, Task 9 flip)
 
   [UserPromptSubmit] ── settings.json ──> scripts/memory_inject_hook.py
-        every prompt                         │  scores (memory_index.py), tiers, injects HIGH
-                                             │  LIVE SCORER since 2026-07-29: RERANK with bounded
-                                             │  lexical fallback (KB_RETRIEVAL=rerank, internal
-                                             │  6s deadline under the 10s hook kill). Judge call
-                                             │  fails -> lexical injected; every row stamps
-                                             │  retrieval_mode (+ rerank_timeout when true); a
-                                             │  retrieve() crash logs tier='error' — NO code path
-                                             │  drops a row. Burn-in gate: fallback < 15%
-                                             │  (scripts/fallback_rate.py, pre-committed).
+        every prompt                         │  retrieves through memory_retrieval.py
+                                             │  (memory_index.py implements scoring); injects HIGH
+                                             │  KB_RETRIEVAL selects lexical (default), embedding,
+                                             │  hybrid or rerank. Rerank uses a bounded deadline
+                                             │  with lexical fallback. Errors are logged.
                                              ├─> logs/memory_injection.jsonl   (EVERY decision; carries session_id)
                                              └─> if state/shadow_retrieval.enabled:
                                                    Popen(detached) scripts/shadow_retrieval.py
@@ -126,6 +122,136 @@ from components.** Keep it current when you change the loop.
                            written to evals/candidates/engagement-labels.md — DATA, never committed)
 ```
 
+## Assistant-first eval review (2026-09-22)
+
+Candidate mining remains deterministic; the assistant reviews relevance against
+the KB and escalates uncertain decisions with reasons. Accepted labels carry
+their reviewer, rationale and attestation. Promote them with:
+
+```bash
+python scripts/eval_foldin.py fold --reviewed evals/candidates/reviewed-accepted.jsonl
+python scripts/eval_foldin.py mine --review-history evals/candidates/review-history.jsonl --batch-size 20
+```
+
+The reviewed import preserves the exact reviewed prompt, checks source identity,
+fresh-HIGH exclusion and known slugs, and only adds train/validation cases.
+Held-out sessions are rejected; existing session splits remain pinned. A repeated
+import is a no-op unless its label conflicts with the existing case, which fails.
+Mining skips tool notifications/skipped turns and held-out sessions, prioritizes
+positive proposals, and omits every event in the supplied review history. Supply
+each prior audit file with another `--review-history` argument for later batches.
+Use `--reviewed` for assistant labels; the legacy Markdown checklist fold assumes
+operator decisions. Audit files, golden cases and their provenance stay local and
+ignored in this public repository. Seed `evals/cases.jsonl` from the example file
+before importing. These judgments add no operator/system agreement pairs and
+provide no independent held-out certification.
+
+Reviewed JSONL rows require `id` (the candidate ID), `src` with `session_id` and
+`ts`, `project`, the exact `prompt`, `expect` (known topic slugs), `kind`, `reviewer`,
+`reason`, and `basis`. Use `provenance: "agent-review"` with
+`operator_attested: false`. An operator-adjudicated label instead uses
+`provenance: "operator-reviewed"`, `operator_attested: true`, and an
+`operator_adjudication` record; record any recommendation the operator saw.
+A review-history row only needs the `src` event identity, so rejected and parked
+candidates can be excluded alongside accepted ones.
+
+## Window scorecard (2026-09-21 fix)
+
+`scorecard.py --window START --until END` selects an inclusive start and exclusive
+end using local ISO dates/timestamps. Depth is computed over the full accrual
+history across tiers before selecting a window, tier or judge version. Helpers
+preserve already-enriched depth; mixed raw/enriched inputs raise rather than
+silently discarding pre-window history.
+
+The CLI defaults to `scorer_version=3` plus the current `JUDGE_VERSION` (override
+with `--judge-version`). `--all-versions` is explicitly diagnostic. Both the
+report and tripwire use the live outcome log for event identity and exposure;
+duplicate `(session_id, ts, injected)` writes count once, retaining the latest
+annotation. A rescored row must also match the live event's project and tier.
+Reconstructed rows absent from the live log are reported as analysis-only, not
+allowed to redefine the registered accrual population.
+
+The report distinguishes **accrued repeat HIGH events**, **analyzed repeat HIGH
+events**, and **unjudged/excluded events**. These are not interchangeable when the
+judge lags. It also reports analysis-only rows, scope/tier mismatches and duplicate
+log writes. The depth≥1 injection-lift comparison is printed explicitly; the
+all-depth difference remains a descriptive metric. Window reads omit all-time
+correction recall because that separate population has no window selector yet.
+
+`--json` returns these fields for audit. Explicit `--log PATH` uses that file for
+both analysis and history unless `--history-log PATH` is supplied; omitted `--log`
+uses the live log for history and the rescored file for analysis. This applies to
+`--window-count` too, fixing the old explicit-default-path ambiguity.
+
+The tripwire stays disarmed without `state/window_open`. Register a window and
+its decision criteria before collecting evidence; rerunning a report does not
+freeze a historical dataset or open a new experiment.
+
+## Retrieval interface (R seam, 2026-09-21)
+
+All retrieval callers use `scripts/memory_retrieval.py`: the prompt hook, Codex
+MCP recall, CLI query, shadow passes, eval harness, recall-miss detector and tune
+gate. `memory_index.py` remains the index builder and scoring implementation.
+Update and consolidation remain in `kb.py`; no schema migration is involved.
+
+`retrieve(query, project=None, max_facts=6, tuning=None, limit=50)` is the default
+callable. A `MemoryRetriever` instance exposes the same method with its own paths
+and configuration:
+
+```python
+from pathlib import Path
+from memory_retrieval import MemoryRetriever
+
+root = Path('/tmp/kb-experiment')
+retriever = MemoryRetriever(
+    index_path=root / 'state/memory_index.json',
+    tuning_path=root / 'config/memory_tuning.yaml',
+    embedding_path=root / 'state/topic_embeddings.json',
+    mode='lexical',
+)
+result = retriever.retrieve('widget cache', project='example')
+```
+
+- Omitted paths use live defaults; specify all three for an isolated store.
+  Explicit missing paths use an empty index, default tuning, or lexical fallback
+  respectively, never the live file. A malformed index raises to the caller.
+- Tuning precedence: per-call dict → instance dict → file merged over defaults.
+  Dicts are complete tuning configs, matching the existing engine contract.
+- Omitted mode reads `KB_RETRIEVAL` at call time. The tune gate pins lexical and
+  shadows select embedding/rerank explicitly, without mutating that environment
+  variable. Backend service settings and other embedding/rerank knobs retain
+  their existing environment configuration.
+- Reads are fresh on each call and never build or write an index/cache. The
+  returned dict retains `query`, `project`, `mode`, `retrieval_config`,
+  `rerank_timeout`, `top_tier`, and ranked `matches` with their facts and paths.
+- Injection policy stays with callers. `project=None` retains the engine's broad
+  legacy search; Codex MCP still filters to global notes when project is omitted.
+
+Tests cover store/config isolation, file refresh, all four modes and backend failures.
+
+## Tuning proposal review
+
+The nightly auditor only adds demotions or raises thresholds. If evidence for an
+existing demotion ages out, it reports a suggestion for human review. Suggestions
+alone do not create a branch. Audit notes contain captured prompts and stay local;
+only tuning configuration is committed to an `auto-tune/<date>` proposal branch.
+
+`scripts/tune_gate.py` records a deterministic shadow verdict for each proposal:
+false HIGH injections on negatives must not rise, no labeled positive HIGH hit may
+be lost, and every tightening needs real traffic evidence. It uses your local
+`evals/cases.jsonl`, excludes `held_out`, and pins lexical retrieval. Missing cases
+produce a gate error rather than treating the synthetic example set as evidence.
+The gate records its verdict; it does not merge. Loosenings require human review.
+
+```bash
+python scripts/tune_gate.py --branch auto-tune/YYYY-MM-DD --no-record
+python scripts/tune_gate.py adjudicate --branch auto-tune/YYYY-MM-DD --decision merge --note 'reason for this decision'
+```
+
+The second command records an operator decision, not a Git merge. Verdicts and
+agreement records stay in ignored `state/`. Assistant-reviewed eval labels do not
+count as independent operator/system agreement pairs.
+
 ## The outcome loop, by layer (the part most easily mis-read)
 
 The reward/utility signal is produced and consumed in three layers. All three are
@@ -144,7 +270,7 @@ live; if outcomes look thin, it's youth (session_id logging is recent), not a wi
   `useful` (engaged AND NOT corrected), `harmful` (engaged AND corrected), or non-useful;
   `decide()` demotes a slug injected HIGH ≥ `min_samples` times with **zero useful**
   outcomes in the window. Demotions go to the **reversible `outcome_demoted`** set
-  (rewritten each run — a slug leaves on its own once its misfires age out), *not* the
+  (add-only proposals; aged-out evidence becomes a human-review suggestion), *not* the
   permanent `high_ineligible`. Added 2026-06-30; before that, auto-tune's only false-HIGH
   signal was synthetic-event injections (which dried up once the hook skipped `<task-notification>`).
 
@@ -157,9 +283,9 @@ live; if outcomes look thin, it's youth (session_id logging is recent), not a wi
 >   engagement (the counterfactual error never happened). This case is **genuinely unmeasurable** from
 >   these fields and sits in the non-useful bucket — an honest limitation, not papered over. A slug is
 >   only demoted on **≥ min_samples** zero-useful outcomes, so one unmeasurable save won't condemn it,
->   and demotion is reversible regardless.
-> The L3 latch (gate 2) is fixed: demotions are the reversible `outcome_demoted` set, never a one-way
-> append to `high_ineligible`.
+>   and a human can reverse a demotion after reviewing the evidence.
+> Demotions use `outcome_demoted`; removing one requires human review. The nightly
+> auditor adds to this set and reports aged-out evidence as a suggestion.
 
 ## The per-topic record (front #2 — BUILT 2026-06-30, not yet consumed)
 
@@ -177,7 +303,7 @@ legible instead of binary-passing.
   `decay_lambda = min(base·2^harmful, 0.05)` — all pure functions of cumulative
   counts over the (append-only) log, never incremented in place. Re-running the
   nightly yields a byte-identical file (verified on real data). No watermark; this
-  mirrors `audit_hooks`' rewrite-the-set-each-run reversibility.
+  keeps the evidence record reproducible while the auditor proposes add-only demotions.
 - **Verdict in lockstep** with `audit_hooks.classify_outcomes`: `useful = engaged
   AND NOT corrected`, `harmful = engaged AND corrected`, else neutral. Difference:
   the record counts **both** high+moderate injects as evidence (more posterior

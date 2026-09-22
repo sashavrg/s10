@@ -6,8 +6,8 @@
 # Read point (measurement-v2 Task 10): depth>=1 HIGH n >= 40, i.e. enough repeat-topic
 # HIGH rows for a ±15pp Wilson CI on the bucket the compounding thesis turns on. The
 # count is delegated to `scorecard.py --window-count` — the same enrich_depth() the
-# curve itself uses — so the tripwire and the read can never diverge (the gate-accrual
-# tripwire's lesson: a reimplemented count trips on the wrong number).
+# readout uses, over the same deduplicated LIVE accrual history. The report shows
+# judged coverage separately; missing/reconstructed judgments cannot move the exit.
 #
 # Quiet until the window exists: state/window_open is written by Task 10 Step 4 and
 # holds one ISO date; with no marker the count is 0 and this never fires.
@@ -50,7 +50,7 @@ fi
 
 echo "[compounding-read] window depth>=1 HIGH rows: $COUNT / $TARGET"
 if [ "$COUNT" -ge "$TARGET" ] && [ ! -f "$MARKER" ]; then
-  notify "📈 KB compounding read DUE — the reopened window has ${COUNT} >= ${TARGET} depth≥1 HIGH rows. Run 'python scripts/scorecard.py' and read signal D (compounding curve) against the pre-registered branches (SUPPORTED / NOT SUPPORTED / REVERSED / INCONCLUSIVE)."
+  notify "📈 KB compounding read DUE — the reopened window has ${COUNT} >= ${TARGET} depth≥1 HIGH rows. Run 'python scripts/scorecard.py --window <window-start-date>' and check judged coverage before reading signal D against the pre-registered branches (SUPPORTED / NOT SUPPORTED / REVERSED / INCONCLUSIVE)."
   date -Iseconds > "$MARKER"
   echo "[compounding-read] notified + marker written"
 fi

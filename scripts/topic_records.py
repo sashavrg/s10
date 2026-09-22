@@ -19,8 +19,8 @@ C2/C3 binary demotion keeps running untouched; the record accrues alongside unti
 functions of cumulative outcome counts (``alpha = 0.5 + w*useful``,
 ``decay_lambda = min(base*2**harmful, cap)``), never incremented in place. Re-running the
 nightly over the append-only outcome log therefore yields *identical* records — no watermark,
-no double-counting. This mirrors the codebase's existing ``replace_list_section`` reversibility
-(rewrite-the-set-each-run) rather than fighting it.
+no double-counting. The record tracks evidence independently of the auditor's
+add-only demotion proposals.
 """
 from __future__ import annotations
 

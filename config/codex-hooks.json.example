@@ -1,0 +1,30 @@
+{
+  "description": "s10 hooks for Codex sessions launched from this repository.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/scripts/memory_inject_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking relevant KB memory",
+            "additionalContextLimit": 1800
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/codex_session_hook.sh\"",
+            "timeout": 3,
+            "statusMessage": "Saving KB learning signals"
+          }
+        ]
+      }
+    ]
+  }
+}

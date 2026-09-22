@@ -156,17 +156,20 @@ def test_replace_list_section_creates_replaces_and_clears():
     assert a.replace_list_section(base, 'outcome_demoted', []) == base   # absent + empty -> no-op
 
 
-def test_apply_actions_outcome_demoted_is_reversible_across_runs():
-    # THE gate-2 property at the file level: a slug demoted one run and no longer
-    # qualifying the next is REMOVED from the file, not latched forever.
+def test_apply_actions_outcome_demoted_never_removes_across_runs():
+    # Gate-2 as AMENDED (operator ruling 2026-09-20, tune-merge plan (a)): the auditor
+    # only ever ADDS to outcome_demoted. A slug that no longer qualifies stays in the
+    # file — its removal is a loosening, and loosenings are human-only (decide()
+    # surfaces it as an `aged_out` suggestion instead). Pre-amendment this test
+    # asserted the opposite (wholesale rewrite → y dropped).
     seed = SEED + "outcome_demoted:\n"
-    t1, _ = a.apply_actions(
+    t1, c1 = a.apply_actions(
         {'add_block': [], 'outcome_demoted': ['x', 'y'], 'new_high': None}, seed)
-    assert '  - x' in t1 and '  - y' in t1
-    t2, _ = a.apply_actions(
+    assert '  - x' in t1 and '  - y' in t1 and c1 == ['outcome_demoted += x, y']
+    t2, c2 = a.apply_actions(
         {'add_block': [], 'outcome_demoted': ['x'], 'new_high': None}, t1)
-    assert '  - x' in t2 and '  - y' not in t2          # y aged out -> earned its way back
-    assert '  - acme' in t2                            # permanent high_ineligible untouched
+    assert '  - x' in t2 and '  - y' in t2 and c2 == []   # y stays; no change reported
+    assert '  - acme' in t2                             # permanent high_ineligible untouched
 
 
 SEED = (
@@ -465,3 +468,91 @@ def test_run_skips_dirty_tracked_tree(tmp_path, monkeypatch):
     # The dirty file is untouched and the tuning file was never modified.
     assert (tmp / 'logs' / '.gitkeep').read_text() == 'dirty\n'
     assert 'monitoring-setup' not in tuning.read_text()
+
+
+# --- decay is a human decision (operator ruling 2026-09-20, plan amendment (a)) ------
+
+STATS_QUIET = {'total_high': 0, 'synthetic_high': 0, 'false_high_rate': 0.0,
+               'slug_misfires': {}, 'promiscuous': []}
+
+
+def _ostats(rows):
+    return a.classify_outcomes(rows, TUNING)
+
+
+def test_decide_keeps_a_merged_demotion_whose_evidence_aged_out():
+    tuning = {**TUNING, 'outcome_demoted': ['dns-blocking']}
+    ostats = _ostats([_out('dns-blocking', engaged=False)])       # 1 row: below min_samples
+    actions = a.decide(STATS_QUIET, tuning, ostats)
+    assert actions['outcome_demoted'] == ['dns-blocking']          # kept, never auto-removed
+    assert actions['aged_out'] == ['dns-blocking']
+    assert any("undemoting 'dns-blocking'" in s for s in actions['suggestions'])
+
+
+def test_decide_unions_fresh_demotions_with_the_current_set():
+    tuning = {**TUNING, 'outcome_demoted': ['dns-blocking']}
+    ostats = _ostats([_out('ticket-x', engaged=False)] * 3)
+    actions = a.decide(STATS_QUIET, tuning, ostats)
+    assert actions['outcome_demoted'] == ['dns-blocking', 'ticket-x']
+    assert actions['aged_out'] == ['dns-blocking']
+    assert 'ticket-x' in actions['outcome_reasons']
+
+
+def test_decide_no_aged_out_when_evidence_still_present():
+    tuning = {**TUNING, 'outcome_demoted': ['dns-blocking']}
+    ostats = _ostats([_out('dns-blocking', engaged=False)] * 3)
+    actions = a.decide(STATS_QUIET, tuning, ostats)
+    assert actions['aged_out'] == [] and actions['outcome_demoted'] == ['dns-blocking']
+    assert not any('undemoting' in s for s in actions['suggestions'])
+
+
+DEMOTED_SEED = SEED + "outcome_demoted:\n  - dns-blocking\n"
+
+
+def test_apply_actions_reports_only_additions_to_outcome_demoted():
+    text, changes = a.apply_actions(
+        {'add_block': [], 'outcome_demoted': ['dns-blocking', 'ticket-x'], 'new_high': None},
+        DEMOTED_SEED)
+    assert changes == ['outcome_demoted += ticket-x']
+    parsed = a.mi._parse_tuning_yaml(text)
+    assert parsed['outcome_demoted'] == ['dns-blocking', 'ticket-x']
+
+
+def test_apply_actions_is_a_noop_when_the_set_is_unchanged():
+    text, changes = a.apply_actions(
+        {'add_block': [], 'outcome_demoted': ['dns-blocking'], 'new_high': None}, DEMOTED_SEED)
+    assert changes == [] and text == DEMOTED_SEED
+
+
+def test_run_with_suggestions_only_cuts_no_branch(tmp_path, monkeypatch):
+    # A standing "consider undemoting" suggestion (ruling (a)) must not produce a
+    # branch: there is no config change to adjudicate. Reported, not committed.
+    log = tmp_path / 'mem.jsonl'; log.write_text('')
+    out = tmp_path / 'out.jsonl'; out.write_text('')
+    tun = tmp_path / 'memory_tuning.yaml'
+    tun.write_text(SEED + "outcome_demoted:\n  - dns-blocking\n"
+                   "auto_tune:\n  enabled: true\n  window_days: 14\n  min_samples: 3\n"
+                   "  cross_project_min: 3\n  threshold_step: 0.01\n  threshold_ceiling: 0.85\n"
+                   "  false_high_rate_trigger: 0.3\n")
+    monkeypatch.setattr(a, 'LOG_PATH', log)
+    monkeypatch.setattr(a, 'OUTCOME_PATH', out)
+    monkeypatch.setattr(a, 'TUNING_PATH', tun)
+    monkeypatch.setattr(a.mi, 'TUNING_PATH', tun)
+    def never(*_, **__): raise AssertionError('_commit_to_branch must not run')
+    monkeypatch.setattr(a, '_commit_to_branch', never)
+    monkeypatch.setattr(a, '_tracked_tree_dirty', lambda: False)
+    res = a.run(now=dt.datetime(2026, 9, 21), dry_run=False)
+    assert res['changed'] is False and res['changes'] == []
+    assert any("undemoting 'dns-blocking'" in s for s in res['suggestions'])
+    assert res['branch'] is None and 'gate' not in res
+
+
+def test_main_reports_standing_suggestions_as_no_action(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(a, 'run', lambda now, dry_run: {
+        'changed': False, 'changes': [], 'branch': None,
+        'suggestions': ["consider undemoting 'dns-blocking' — evidence aged out"]})
+    monkeypatch.setattr('sys.argv', ['audit_hooks.py'])
+    a.main()
+    out = capsys.readouterr().out.strip()
+    assert out.startswith('audit_hooks: no action')          # run_pipeline: no Telegram
+    assert "undemoting 'dns-blocking'" in out                  # but the log carries it

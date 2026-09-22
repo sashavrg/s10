@@ -110,6 +110,7 @@ from pathlib import Path
 import engagement_judge as ej
 from injection_outcome import parse_turns
 from outcome_matching import slug_tokens, tokenize
+from memory_inject_hook import is_synthetic
 
 PROMPT_CAP = 1000
 
@@ -154,6 +155,8 @@ def mine_candidates(inj_rows: list[dict], v1_rows: list[dict],
         if (key in burn_keys) or (key in taken_keys):
             continue
         tier = r.get('tier')
+        if tier == 'skipped' or is_synthetic(r.get('prompt_head') or ''):
+            continue
         base = {'src': {'session_id': key[0], 'ts': key[1]},
                 'project': r.get('project'), 'prompt_head': r.get('prompt_head'),
                 'hide_score': False}
@@ -162,7 +165,7 @@ def mine_candidates(inj_rows: list[dict], v1_rows: list[dict],
                         'hide_score': True,
                         'signal': 'HIGH fire with NO outcome signal — judge '
                                   'independently; the scorer fire is NOT evidence'})
-        elif tier in ('none', 'skipped'):
+        elif tier == 'none':
             out.append({**base, 'expect_proposed': [],
                         'signal': f'tier={tier}: nothing advertised — silence right?'})
         elif tier == 'moderate':
@@ -359,7 +362,13 @@ def fold(answers: list[dict]) -> dict:
                  for a in answers if a['keep']]
     counts = {'folded': 0, 'no_injection_row': 0,
               'rejected': sum(1 for a in answers if not a['keep'])}
-    existing_ids = {c.get('id') for c in _read_jsonl(CASES_PATH)}
+    existing = _read_jsonl(CASES_PATH)
+    existing_ids = {c.get('id') for c in existing}
+    sessions = defaultdict(set)
+    for c in existing:
+        sid = c.get('src', {}).get('session_id')
+        if sid:
+            sessions[sid].add(c.get('split'))
     new_lines = []
     for row in staged + confirmed:
         if row['id'] in existing_ids:
@@ -368,6 +377,14 @@ def fold(answers: list[dict]) -> dict:
         if case is None:
             counts['no_injection_row'] += 1
             continue
+        sid = case['src']['session_id']
+        splits = sessions.get(sid, set()) if sid else set()
+        if len(splits) > 1 or (splits and None in splits):
+            raise ValueError(f'existing session has inconsistent splits: {sid}')
+        if splits:
+            case['split'] = next(iter(splits))
+        if sid:
+            sessions[sid].add(case['split'])
         new_lines.append(json.dumps(case))
         existing_ids.add(row['id'])
         counts['folded'] += 1
@@ -401,10 +418,112 @@ def status_counts(cases: list[dict]) -> dict:
             'remaining_to_target': max(0, TARGET - len(cases))}
 
 
+def read_reviewed(path: Path) -> list[dict]:
+    """Reviewed input must fail loudly on missing files or malformed JSON."""
+    return [json.loads(line) for line in path.read_text().splitlines()
+            if line.strip() and not line.startswith('#')]
+
+
+def fold_reviewed(rows: list[dict]) -> dict:
+    """Promote explicit reviewed labels, preserving evidence and excluding held-out.
+
+    This path never consumes the unrelated auto-stage or checklist. Validate the
+    entire batch before writing, so a bad label cannot cause a partial promotion.
+    """
+    existing = _read_jsonl(CASES_PATH)
+    ids = {r['id'] for r in existing}
+    sessions = defaultdict(set)
+    for r in existing:
+        sid = r.get('src', {}).get('session_id')
+        if sid:
+            sessions[sid].add(r.get('split'))
+    inj = _read_jsonl(INJECTION_LOG_PATH)
+    inj_keys = {(r.get('session_id') or '', r.get('ts')) for r in inj}
+    cal_keys = {(r.get('session_id'), r.get('ts'), r.get('injected'))
+                for r in _read_jsonl(CAL_PATH)}
+    burn = build_burn_keys(_read_jsonl(V1_PATH), _read_jsonl(V2_PATH), cal_keys, inj)
+    import memory_index as mi
+    known = {e['slug'] for e in mi.load_index()['entries']}
+    new = []
+    counts = {'folded': 0, 'already_present': 0}
+    for r in rows:
+        src = r['src']
+        sid, ts = src['session_id'], src['ts']
+        if r['id'] != candidate_id(sid, ts):
+            raise ValueError('reviewed id does not match source')
+        if r['id'] in ids:
+            prior = next(c for c in existing + new if c['id'] == r['id'])
+            if any(prior.get(k) != r.get(k) for k in
+                   ('prompt', 'expect', 'kind', 'project', 'provenance',
+                    'operator_attested', 'reviewer', 'reason', 'basis',
+                    'operator_adjudication')):
+                raise ValueError(f"conflicting reviewed label: {r['id']}")
+            counts['already_present'] += 1
+            continue
+        if (sid, ts) in burn or (sid, ts) not in inj_keys:
+            raise ValueError(f"burned or missing injection source: {r['id']}")
+        provenance = r.get('provenance')
+        if (provenance not in ('agent-review', 'operator-reviewed') or
+                r.get('operator_attested') is not (provenance == 'operator-reviewed')):
+            raise ValueError('invalid review provenance/attestation')
+        if provenance == 'operator-reviewed' and not r.get('operator_adjudication'):
+            raise ValueError('operator-reviewed label needs adjudication record')
+        if any(not isinstance(r.get(k), str) or not r[k].strip()
+               for k in ('prompt', 'reviewer', 'reason', 'basis')):
+            raise ValueError('reviewed label needs prompt, reviewer, reason and basis')
+        expect = r.get('expect')
+        if (not isinstance(expect, list) or
+                any(not isinstance(s, str) or s not in known for s in expect)):
+            raise ValueError('invalid or unknown expected slug')
+        if r.get('kind') not in (('direct', 'paraphrase') if expect else ('negative',)):
+            raise ValueError('kind does not match expected slugs')
+        if is_synthetic(r['prompt']):
+            raise ValueError('synthetic turns are not retrieval cases')
+        splits = sessions.get(sid, set()) if sid else set()
+        if splits and (len(splits) != 1 or not splits <= {'train', 'val'}):
+            raise ValueError(f'cannot add reviewed label to held-out/unassigned session: {sid}')
+        split = next(iter(splits)) if splits else (
+            'train' if eval_split.stable_bucket(sid or r['id']) < .75 else 'val')
+        case = {k: r[k] for k in ('id', 'kind', 'project', 'prompt', 'expect',
+                                  'provenance', 'src', 'reviewer',
+                                  'operator_attested', 'reason', 'basis')}
+        for k in ('operator_adjudication', 'head_only', 'reviewed_at'):
+            if k in r:
+                case[k] = r[k]
+        case['split'] = split
+        new.append(case)
+        ids.add(case['id'])
+        if sid:
+            sessions[sid].add(split)
+    if new:
+        text = CASES_PATH.read_text()
+        CASES_PATH.write_text(text.rstrip('\n') + '\n' +
+                             '\n'.join(json.dumps(r) for r in new) + '\n')
+    counts['folded'] = len(new)
+    return counts
+
+
+def select_batch(candidates: list[dict], size: int) -> list[dict]:
+    """Positive proposals first; stable order within each class."""
+    return sorted(candidates, key=lambda c: (
+        not bool(c['expect_proposed']), eval_split.stable_bucket(
+            candidate_id(c['src']['session_id'], c['src']['ts']))))[:size]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description='#1d eval-case fold-in (mine/fold/status).')
     ap.add_argument('cmd', choices=('mine', 'fold', 'status'))
+    ap.add_argument('--reviewed', type=Path, help='fold reviewed JSONL into train/val only')
+    ap.add_argument('--review-history', type=Path, action='append', default=[],
+                    help='mine: skip source events already adjudicated in this JSONL (repeatable)')
+    ap.add_argument('--batch-size', type=int, default=BATCH_SIZE)
     args = ap.parse_args()
+    if args.reviewed and args.cmd != 'fold':
+        ap.error('--reviewed requires fold')
+    if args.review_history and args.cmd != 'mine':
+        ap.error('--review-history requires mine')
+    if args.batch_size < 1:
+        ap.error('--batch-size must be positive')
     if args.cmd == 'status':
         print(json.dumps(status_counts(_read_jsonl(CASES_PATH)), indent=2))
         return
@@ -422,26 +541,45 @@ def main() -> None:
             HOOKTUNING_PATH.read_text(errors='replace') if HOOKTUNING_PATH.exists() else '')
         auto_ht, n_burned_ht = hooktuning_autofold(traces, inj, burn)
         auto = auto_cal + auto_ht
+        reviewed_keys = {(r['src']['session_id'], r['src']['ts'])
+                         for path in args.review_history for r in read_reviewed(path)}
+        auto = [r for r in auto if (r['src']['session_id'], r['src']['ts'])
+                not in reviewed_keys]
         taken = {(r['src']['session_id'], r['src']['ts']) for r in auto}
+        taken |= reviewed_keys
         cands = check_cal + mine_candidates(inj, v1, v2, burn, taken)
         inj_by_key = {(r.get('session_id'), r.get('ts')): r for r in inj}
+        existing = _read_jsonl(CASES_PATH)
+        held_sessions = {r['src']['session_id'] for r in existing
+                         if r.get('split') == 'held_out' and r.get('src', {}).get('session_id')}
+        suppressed = {'synthetic_or_skipped': sum(
+            r.get('tier') == 'skipped' or is_synthetic(r.get('prompt_head') or '') for r in inj),
+            'held_out_candidates': 0}
         full = []
         for c in cands:
+            if (c['src']['session_id'], c['src']['ts']) in reviewed_keys:
+                continue
+            if c['src']['session_id'] in held_sessions:
+                suppressed['held_out_candidates'] += 1
+                continue
             r = inj_by_key.get((c['src']['session_id'], c['src']['ts']))
             if r is None:
                 continue
             c = dict(c)
             c['prompt'], c['head_only'] = recover_prompt(r)
+            if r.get('tier') == 'skipped' or is_synthetic(c['prompt']):
+                continue
             c.setdefault('project', r.get('project'))
             c.setdefault('hide_score', False)
             full.append(c)
-        existing = _read_jsonl(CASES_PATH)
         kept, collisions, dd = dedup_candidates(full, existing)
-        batch = sorted(kept + collisions, key=lambda c: eval_split.stable_bucket(
-            candidate_id(c['src']['session_id'], c['src']['ts'])))[:BATCH_SIZE]
+        batch = select_batch(kept + collisions, args.batch_size)
         AUTO_STAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
         AUTO_STAGE_PATH.write_text('\n'.join(json.dumps(r) for r in auto) + '\n' if auto else '')
         REVIEW_PATH.write_text(render_checklist(batch))
+        print(f'prior review sources excluded: {len(reviewed_keys)}; '
+              f'positive proposals in batch: {sum(bool(c["expect_proposed"]) for c in batch)}')
+        print(f'mining exclusions: {suppressed}')
         print(f'auto-staged {len(auto)} (calibration {len(auto_cal)}, hook-tuning '
               f'{len(auto_ht)}; burned-ht {n_burned_ht}) -> {AUTO_STAGE_PATH}')
         print(f'checklist {len(batch)}/{len(kept) + len(collisions)} candidates '
@@ -449,6 +587,10 @@ def main() -> None:
               f'dup_exact {dd["dup_exact"]}) -> {REVIEW_PATH}')
         return
     # fold
+    if args.reviewed:
+        counts = fold_reviewed(read_reviewed(args.reviewed))
+        print(json.dumps({**counts, **status_counts(_read_jsonl(CASES_PATH))}, indent=2))
+        return
     answers, incomplete = ([], [])
     if REVIEW_PATH.exists():
         answers, incomplete = parse_checklist(REVIEW_PATH.read_text())

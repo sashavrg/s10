@@ -28,14 +28,18 @@ from ``topic_records`` so the definition stays canonical across the whole system
 
 ``main()`` defaults ``--log`` to ``logs/injection_outcomes_rescored.jsonl`` (the v2
 analysis dataset, union-merge retained by ``rescore_outcomes.py``) when it exists,
-falling back to the live ``injection_outcomes.jsonl`` otherwise, and prints a mix
-header first so a run over mixed data is legible before the numbers are read —
-one count per (scorer_version, judge_version) PAIR (v1(untagged) / v2 / v3/<judge_version>,
-e.g. ``v3/ej2-qwen2.5:7b``), never scorer_version alone (see ``current_rows()``).
+falling back to the live ``injection_outcomes.jsonl`` otherwise. Analysis is pinned
+to (scorer_version=3, current judge_version); --all-versions is diagnostic only.
+The live log supplies deduplicated event identity and depth BEFORE time, tier or
+judge filtering. Coverage reports reconstructed analysis-only events and pending
+judgments separately from the tripwire's accrual count. --window START / --until
+END select [START, END), without losing earlier history. Explicit --log supplies
+its own history unless --history-log is given, so isolated reads stay isolated.
 """
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import math
 import os
@@ -85,7 +89,9 @@ def enrich_depth(outcomes: list[dict]) -> list[dict]:
     ts-sorted copy, so input order is irrelevant and same-session repeats don't inflate
     depth. Keyed on (slug, project) so a slug recurring in one project never counts as
     depth for the same slug in a different project."""
-    ordered = sorted(outcomes, key=lambda r: r.get('ts') or '')
+    # SessionEnd can append the same event again. Count events, not log writes;
+    # later copies carry the latest annotation but do not create new exposure.
+    ordered = sorted(unique_rows(outcomes), key=lambda r: r.get('ts') or '')
     seen: dict[tuple, set] = {}
     out = []
     for row in ordered:
@@ -100,12 +106,42 @@ def enrich_depth(outcomes: list[dict]) -> list[dict]:
     return out
 
 
+def event_key(row: dict) -> tuple:
+    """Same durable event key as rescore_outcomes._row_key."""
+    return (row.get('session_id'), row.get('ts'), row.get('injected'))
+
+
+def unique_rows(rows: list[dict]) -> list[dict]:
+    return list({event_key(r): r for r in rows}.values())
+
+
+def with_depth(rows: list[dict]) -> list[dict]:
+    """Keep depth computed BEFORE a caller's window/tier/version selection.
+
+    Reject partially enriched populations: recomputing would erase history for
+    some rows; trusting them would mix incompatible depth definitions.
+    """
+    annotated = ['prior_session_depth' in r for r in rows]
+    if any(annotated) and not all(annotated):
+        raise ValueError('Mixed raw and depth-enriched rows; enrich full history first')
+    if all(annotated):
+        return [{**r, 'repeat_topic': r['prior_session_depth'] > 0}
+                for r in unique_rows(rows)]
+    return enrich_depth(rows)
+
+
+def in_window(row: dict, start: str | None, end: str | None = None) -> bool:
+    ts = row.get('ts') or ''
+    return (start is None or ts >= start) and (end is None or ts < end)
+
+
 def correctness_on_seen(outcomes: list[dict]) -> dict:
     """A — engaged-without-correction (useful) rate over repeat-topic injects only."""
-    repeats = [r for r in enrich_depth(outcomes) if r['repeat_topic']]
+    repeats = [r for r in with_depth(outcomes) if r['repeat_topic']]
     useful = sum(1 for r in repeats if outcome_verdict(r) == 'useful')
     n = len(repeats)
-    return {'repeat_injects': n, 'useful': useful, 'rate': (useful / n) if n else None}
+    return {'repeat_injects': n, 'useful': useful, 'rate': (useful / n) if n else None,
+            'ci': wilson(useful, n)}
 
 
 # The reopened collection window's pre-registered read point (measurement-v2 Task 10):
@@ -128,7 +164,8 @@ def window_open_date() -> str | None:
         return None
 
 
-def window_progress(outcomes: list[dict], window_start: str | None) -> dict:
+def window_progress(outcomes: list[dict], window_start: str | None,
+                    window_end: str | None = None) -> dict:
     """How close the reopened window is to its first compounding read.
 
     Counts HIGH-tier rows *inside* the window whose topic is a repeat. Depth is
@@ -140,9 +177,9 @@ def window_progress(outcomes: list[dict], window_start: str | None) -> dict:
     means no window has been declared open yet, which is 0 and never ready."""
     if not window_start:
         return {'n': 0, 'target': WINDOW_TARGET, 'ready': False, 'window_start': None}
-    n = sum(1 for r in enrich_depth(outcomes)
+    n = sum(1 for r in with_depth(outcomes)
             if r['repeat_topic'] and r.get('tier') == 'high'
-            and (r.get('ts') or '') >= window_start)
+            and in_window(r, window_start, window_end))
     return {'n': n, 'target': WINDOW_TARGET, 'ready': n >= WINDOW_TARGET,
             'window_start': window_start}
 
@@ -151,7 +188,7 @@ def compounding_curve(outcomes: list[dict]) -> list[dict]:
     """D — engagement/useful rate per prior-session-depth bucket. Empty buckets omitted
     (reporting a 0/0 bucket would read as a real measurement; it isn't)."""
     buckets: dict[str, dict] = {}
-    for r in enrich_depth(outcomes):
+    for r in with_depth(outcomes):
         label = _bucket_for(r['prior_session_depth'])
         b = buckets.setdefault(label, {'bucket': label, 'n': 0, 'engaged': 0, 'useful': 0})
         b['n'] += 1
@@ -171,6 +208,7 @@ def compounding_curve(outcomes: list[dict]) -> list[dict]:
 
 def signals_for(outcomes: list[dict]) -> dict:
     """A + D for ONE tier population. Never call on mixed tiers."""
+    outcomes = with_depth(outcomes)
     useful = sum(1 for r in outcomes if outcome_verdict(r) == 'useful')
     return {
         'n': len(outcomes),
@@ -182,14 +220,51 @@ def signals_for(outcomes: list[dict]) -> dict:
     }
 
 
-def scorecard(outcomes: list[dict], recall_stats: dict | None = None) -> dict:
+def scorecard(outcomes: list[dict], recall_stats: dict | None = None, *,
+              window_start: str | None = None, window_end: str | None = None,
+              history: list[dict] | None = None, judge_version: str | None = None) -> dict:
     """Tier-stratified scorecard. HIGH = injected population (the thesis's subject);
     MODERATE = advertised-only control arm (organic recurrence, no memory in context).
-    injection_lift = useful_rate(high) - useful_rate(moderate). Signal B uses the
-    symmetric correction-population stats from recall_miss.stats() (Task 6)."""
+    injection_lift retains the descriptive all-depth difference; the registered
+    repeat-only comparison is repeat_injection_lift. history supplies the full
+    accrual population; analysis rows are aligned to it before window selection.
+    Signal B uses the symmetric correction-population stats from recall_miss.stats()."""
+    # One history defines exposure for both the tripwire and the readout. Judge
+    # annotations may lag or contain reconstructed events absent from that log.
+    # Match only identical events and scope; expose every exclusion as coverage.
+    history_input = outcomes if history is None else history
+    canonical = with_depth(history_input)
+    by_key = {event_key(r): r for r in canonical}
+    selected = current_rows(outcomes, judge_version) if judge_version else outcomes
+    aligned = []
+    coverage = {'analysis_only': 0, 'metadata_mismatch': 0}
+    for row in unique_rows(selected):
+        if not in_window(row, window_start, window_end):
+            continue
+        source = by_key.get(event_key(row))
+        if source is None:
+            coverage['analysis_only'] += 1
+            continue
+        if any(row.get(f) != source.get(f) for f in ('project', 'tier')):
+            coverage['metadata_mismatch'] += 1
+            continue
+        aligned.append({**row, 'prior_session_depth': source['prior_session_depth'],
+                        'repeat_topic': source['repeat_topic']})
+    outcomes = aligned
+    population = [r for r in canonical if in_window(r, window_start, window_end)]
+    eligible = sum(r.get('tier') == 'high' and r['repeat_topic'] for r in population)
+    covered = sum(r.get('tier') == 'high' and r['repeat_topic'] for r in outcomes)
+    coverage.update(history_rows=len(population), analyzed_rows=len(outcomes),
+                    high_repeat_eligible=eligible, high_repeat_analyzed=covered,
+                    high_repeat_unjudged=eligible - covered,
+                    duplicate_history_rows=len(history_input) - len(canonical),
+                    duplicate_analysis_rows=len(selected) - len(unique_rows(selected)))
     high = [r for r in outcomes if r.get('tier') == 'high']
     moderate = [r for r in outcomes if r.get('tier') == 'moderate']
     hi, mo = signals_for(high), signals_for(moderate)
+    ha, ma = hi['correctness_on_seen'], mo['correctness_on_seen']
+    repeat_lift = (round(ha['rate'] - ma['rate'], 4)
+                   if ha['rate'] is not None and ma['rate'] is not None else None)
     lift = None
     if hi['useful_rate'] is not None and mo['useful_rate'] is not None:
         lift = round(hi['useful_rate'] - mo['useful_rate'], 4)
@@ -206,9 +281,14 @@ def scorecard(outcomes: list[dict], recall_stats: dict | None = None) -> dict:
         }
     return {
         'n_outcomes': len(outcomes),
+        'window': {'start': window_start, 'end_exclusive': window_end},
+        'judge_version': judge_version,
+        'coverage': coverage,
         'by_tier': {'high': hi, 'moderate': mo},
         'injection_lift': {'lift': lift, 'high_ci': hi['useful_ci'],
                            'moderate_ci': mo['useful_ci']},
+        'repeat_injection_lift': {'lift': repeat_lift, 'high_ci': ha['ci'],
+                                  'moderate_ci': ma['ci']},
         'recall': recall,
         'cost': {'available': False, 'needs': 'per-task token logging'},
     }
@@ -239,6 +319,18 @@ def _fmt_ci(ci) -> str:
 def _format(card: dict) -> str:
     lines = [f"Production scorecard — {card['n_outcomes']} outcomes "
              f"(HIGH = injected; MODERATE = advertised-only control)"]
+    window = card['window']
+    if window['start'] or window['end_exclusive']:
+        lines.append(f"Window: {window['start'] or 'beginning'} <= ts < "
+                     f"{window['end_exclusive'] or 'now'}; depth from full history")
+    c = card['coverage']
+    lines.append(f"HIGH repeats: accrued {c['high_repeat_eligible']}; "
+                 f"analyzed {c['high_repeat_analyzed']}; "
+                 f"unjudged/excluded {c['high_repeat_unjudged']}")
+    lines.append(f"Analysis exclusions: {c['analysis_only']} absent from accrual history; "
+                 f"{c['metadata_mismatch']} scope/tier mismatches")
+    lines.append(f"Duplicate log writes removed (full input): "
+                 f"{c['duplicate_history_rows']} accrual; {c['duplicate_analysis_rows']} analysis")
     for tier in ('high', 'moderate'):
         s = card['by_tier'][tier]
         a = s['correctness_on_seen']
@@ -251,8 +343,12 @@ def _format(card: dict) -> str:
         for b in s['compounding_curve']:
             ur = f"{b['useful_rate']:.0%}" if b['useful_rate'] is not None else "  - "
             lines.append(f"        {b['bucket']:<6} {b['n']:>4}   {ur:>5} {_fmt_ci(b['useful_ci'])}")
+    lf = card['repeat_injection_lift']
+    lines += ["", "injection lift, depth>=1 (high − moderate useful rate): "
+              + (f"{lf['lift']:+.0%}" if lf['lift'] is not None else "n/a")
+              + f"   high{_fmt_ci(lf['high_ci'])} vs moderate{_fmt_ci(lf['moderate_ci'])}"]
     lf = card['injection_lift']
-    lines += ["", "injection lift (high − moderate useful rate): "
+    lines += ["injection lift, all depths (descriptive): "
               + (f"{lf['lift']:+.0%}" if lf['lift'] is not None else "n/a")
               + f"   high{_fmt_ci(lf['high_ci'])} vs moderate{_fmt_ci(lf['moderate_ci'])}"]
     rec = card['recall']
@@ -279,23 +375,37 @@ def current_rows(rows: list[dict], judge_version: str) -> list[dict]:
 def main() -> None:
     ap = argparse.ArgumentParser(description='Tier-stratified production scorecard.')
     default_log = RESCORED_PATH if RESCORED_PATH.exists() else OUTCOME_PATH
-    ap.add_argument('--log', default=str(default_log))
+    ap.add_argument('--log', help='analysis log; an explicit log also supplies history unless --history-log is set')
+    ap.add_argument('--history-log', help='canonical accrual log used for event identity and full-history depth')
+    ap.add_argument('--window', type=_iso_bound, metavar='START',
+                    help='inclusive ISO date/timestamp window start')
+    ap.add_argument('--until', type=_iso_bound, metavar='END',
+                    help='exclusive ISO date/timestamp window end')
+    from engagement_judge import JUDGE_VERSION
+    ap.add_argument('--judge-version', default=JUDGE_VERSION,
+                    help='analysis requires scorer_version=3 and this judge version')
+    ap.add_argument('--all-versions', action='store_true',
+                    help='diagnostic only: include mixed instruments (not a registered readout)')
+    ap.add_argument('--json', action='store_true', help='print the report as JSON')
     ap.add_argument('--window-count', action='store_true',
                     help="print the reopened window's depth>=1 HIGH count on stdout "
                          '(the compounding-read tripwire input); writes nothing')
     args = ap.parse_args()
-    outcomes = read_outcomes(args.log)
+    if args.window and args.until and args.until <= args.window:
+        ap.error('--until must be later than --window')
     if args.window_count:
-        # Count accrual from the LIVE log unless --log was given explicitly: the
-        # rescored analysis file refreshes only when upkeep runs, and a stale
-        # file silently under-reads the window (2026-08-10: 0/40 vs a true 19/40).
-        if args.log == str(default_log) and str(default_log) != str(OUTCOME_PATH):
-            outcomes = read_outcomes(OUTCOME_PATH)
-        p = window_progress(outcomes, window_open_date())
+        # Explicit --log must be honored even when it equals default_log.
+        path = args.history_log or args.log or OUTCOME_PATH
+        outcomes = read_outcomes(path)
+        p = window_progress(outcomes, args.window or window_open_date(), args.until)
         print(f"window {p['window_start'] or '(not open)'} · depth>=1 HIGH "
-              f"{p['n']}/{p['target']}", file=sys.stderr)
+              f"{p['n']}/{p['target']} · accrual {path}", file=sys.stderr)
         print(p['n'])
         return
+    log_path = args.log or default_log
+    history_path = args.history_log or args.log or OUTCOME_PATH
+    outcomes = read_outcomes(log_path)
+    history = read_outcomes(history_path)
     from collections import Counter
     pairs = Counter(
         (r.get('scorer_version') if 'scorer_version' in r else 1, r.get('judge_version'))
@@ -305,14 +415,42 @@ def main() -> None:
         return f"v3/{jv}" if sv == 3 else (f"v{sv}" if sv != 1 else "v1(untagged)")
     mix = ' · '.join(f"{_pair_label(p)}: {n}" for p, n in sorted(
         pairs.items(), key=lambda kv: str(kv[0]), reverse=True))
-    try:
-        import recall_miss
-        rstats = recall_miss.stats()
-    except Exception:
-        rstats = None
-    print(f"[reading {args.log}]")
+    # Recall uses a separate correction population with no matching time selector.
+    # Never present its all-time value as a window measurement (or consult live
+    # retrieval when the caller explicitly requested an isolated log).
+    rstats = None
+    if not (args.window or args.until or args.log or args.history_log):
+        try:
+            import recall_miss
+            rstats = recall_miss.stats()
+        except Exception:
+            pass
+    card = scorecard(outcomes, recall_stats=rstats, history=history,
+                     window_start=args.window, window_end=args.until,
+                     judge_version=None if args.all_versions else args.judge_version)
+    if rstats is None and (args.window or args.until):
+        card['recall']['needs'] = 'window-scoped correction statistics (all-time recall omitted)'
+    card['analysis_log'] = str(log_path)
+    card['history_log'] = str(history_path)
+    card['instrument'] = 'mixed (diagnostic)' if args.all_versions else f'v3/{args.judge_version}'
+    if args.json:
+        print(json.dumps(card, indent=2))
+        return
+    print(f"[reading {log_path}; accrual history {history_path}]")
     print(f"[rows: {len(outcomes)} · {mix}]")
-    print(_format(scorecard(outcomes, recall_stats=rstats)))
+    print(f"[instrument: {card['instrument']}]")
+    print(_format(card))
+
+
+def _iso_bound(value: str) -> str:
+    """Logs use local, offset-free ISO timestamps; avoid lexical timezone traps."""
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError('expected an ISO date or timestamp') from e
+    if parsed.tzinfo is not None:
+        raise argparse.ArgumentTypeError('use local timestamps without a timezone offset, matching the logs')
+    return parsed.isoformat()
 
 
 if __name__ == '__main__':

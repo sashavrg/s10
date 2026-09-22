@@ -549,8 +549,15 @@ def classify_cloud_error(text: str) -> str:
     lowered = text.lower()
     if 'session limit' in lowered or 'weekly limit' in lowered or 'usage limit' in lowered:
         return 'quota'
+    # 'subscription access' / 'ask your admin' cover the org-entitlement refusal
+    # ("Your organization has disabled Claude subscription access for Claude
+    # Code"), which carries none of the words above and so used to fall through
+    # to 'other' — the nightly reported four straight nights of `other×N` while
+    # the real cause was an OAuth token bound to an org that had switched Claude
+    # Code off. Checked after quota so a limit message still buckets as quota.
     if 'login' in lowered or 'logged in' in lowered or 'authentication' in lowered \
-       or 'revoked' in lowered or '401' in lowered or 'unauthorized' in lowered:
+       or 'revoked' in lowered or '401' in lowered or 'unauthorized' in lowered \
+       or 'subscription access' in lowered or 'ask your admin' in lowered:
         return 'auth'
     if 'network' in lowered or 'timeout' in lowered or 'connection' in lowered or 'getaddrinfo' in lowered:
         return 'network'

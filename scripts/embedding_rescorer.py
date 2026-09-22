@@ -85,20 +85,21 @@ def cosine(a, b) -> float:
     return dot / (na * nb)
 
 
-def load_cache() -> dict:
-    if CACHE_PATH.exists():
+def load_cache(path: Path | None = None) -> dict:
+    path = CACHE_PATH if path is None else path
+    if path.exists():
         try:
-            return json.loads(CACHE_PATH.read_text())
+            return json.loads(path.read_text())
         except Exception:
             pass
     return {'model': EMBED_MODEL, 'topics': {}}
 
 
-def load_topic_vectors() -> dict:
+def load_topic_vectors(path: Path | None = None) -> dict:
     """slug -> vec, from cache ONLY (never builds). Empty dict if the cache is
     missing or was built with a different model — the caller treats empty as
     'embeddings unavailable' and falls back to lexical."""
-    cache = load_cache()
+    cache = load_cache() if path is None else load_cache(path)
     if cache.get('model') != EMBED_MODEL:
         return {}
     return {slug: rec['vec'] for slug, rec in cache.get('topics', {}).items() if rec.get('vec')}

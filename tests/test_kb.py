@@ -197,6 +197,20 @@ def test_classify_cloud_error_buckets():
     assert kb.classify_cloud_error('some other failure') == 'other'
 
 
+def test_classify_cloud_error_entitlement_is_auth():
+    """An org that has switched off Claude Code subscription access is an AUTH
+    failure, not 'other'. Regression: 2026-09-05..09 the nightly fell back to
+    local on every item for four nights and the Telegram notice only ever said
+    'other', which named nothing actionable."""
+    import kb
+    msg = ('Your organization has disabled Claude subscription access for '
+           'Claude Code \u00b7 Use an Anthropic API key instead, or ask your '
+           'admin to enable access')
+    assert kb.classify_cloud_error(msg) == 'auth'
+    # The same text as it actually arrives: embedded in the serialized payload.
+    assert kb.classify_cloud_error('{"is_error": true, "result": "%s"}' % msg) == 'auth'
+
+
 def test_claude_code_generate_returns_result_field(monkeypatch):
     import json as _json
     import types

@@ -72,7 +72,7 @@ compiled/topics/ → review            → review/dashboard.md + open_questions.
 
 **Ollama integration:** All local LLM calls go through `ollama_generate()`, which POSTs to `${KB_OLLAMA_URL:-http://127.0.0.1:11434}/api/generate`. Prompts live in `prompts/`. The model is passed at call time — no global model state.
 
-**Cloud LLM backends (optional):** the dispatcher `llm_generate(primary, fallback, prompt, …)` parses `backend:model` specs — `claude:opus`, `claude:sonnet`, `ollama:<tag>`, or a bare tag (= ollama) — via `parse_model_spec`. Cloud calls run `claude -p --model <m> --output-format json` with the prompt on stdin, from a neutral cwd and with `ANTHROPIC_API_KEY` scrubbed so subscription OAuth (`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`, in `.env`) is used. On any `CloudLLMError` the dispatcher falls back to the local model and records the event in `state/last_run_report.json`; the wrapper turns these into one consolidated Telegram notice. Only per-source summaries and topic pages call an LLM; the review dashboard is deterministic assembly.
+**Cloud LLM backends (optional):** the dispatcher `llm_generate(primary, fallback, prompt, …)` parses `backend:model` specs — `claude:opus`, `claude:sonnet`, `ollama:<tag>`, or a bare tag (= ollama) — via `parse_model_spec`. Cloud calls run `claude -p --model <m> --output-format json` with the prompt on stdin, from a neutral cwd and with `ANTHROPIC_API_KEY` scrubbed so subscription OAuth (ambient CLI login, optionally overridden by `CLAUDE_CODE_OAUTH_TOKEN`) is used. On any `CloudLLMError` the dispatcher falls back to the local model and records the event in `state/last_run_report.json`; the wrapper turns these into one consolidated Telegram notice. Only per-source summaries and topic pages call an LLM; the review dashboard is deterministic assembly.
 
 **Shell wrapper (`scripts/run_pipeline.sh`):** wraps `kb.py run` with model auto-pick (candidate lists probed against `/api/tags`; aborts loudly if no summary model resolves), optional sync, and Telegram notifications (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` in `.env`). Sync is opt-in: `KB_DASHBOARD_DIR` (local data dir) or `KB_REMOTE_HOST` + `KB_REMOTE_DATA_DIR` (rsync over SSH); with neither set the run is fully local. The wrapper self-logs to `logs/pipeline.log` via `tee -a` — the crontab entry must NOT add its own `>>` redirect.
 
@@ -85,6 +85,11 @@ Markdown meant to be classified by the KB should carry an identity block in the 
 ## Self-improvement feedback loop (optional runtime wiring)
 
 Two Claude Code hooks (UserPromptSubmit memory injection, SessionEnd correction harvest + outcome scoring) log every decision, and a nightly job tightens the tuning from that signal. The wiring is not obvious from `~/.claude/settings.json` alone — the registered entrypoints spawn further scripts. Before assuming something "isn't wired," read the single current-state map: **`docs/feedback-loop.md`** (topology + per-layer detail + copy-paste "verify it's wired" checks). Update that map whenever you change the loop.
+
+**Retrieval interface:** use `memory_retrieval.retrieve()` for live defaults or a
+configured `MemoryRetriever` for explicit index, tuning, cache paths and scorer
+mode. `memory_index.py` owns scoring and index building. The tune gate pins lexical
+and excludes held-out cases. Reviewed imports add train/validation cases only.
 
 ## Hook misfire notes
 

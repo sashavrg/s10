@@ -130,14 +130,13 @@ def main() -> None:
             pass
 
     try:
-        import memory_index as mi
+        from memory_retrieval import MemoryRetriever
     except Exception as e:
-        _diag(f'memory_index import failed: {e}')
+        _diag(f'memory_retrieval import failed: {e}')
         return
 
-    os.environ['KB_RETRIEVAL'] = 'embedding'   # force embedding for THIS process only
     try:
-        emb_res = mi.retrieve(job['prompt'], project=job.get('project'))
+        emb_res = MemoryRetriever(mode='embedding').retrieve(job['prompt'], project=job.get('project'))
     except Exception as e:
         _diag(f'embedding retrieve raised: {e}')
         return
@@ -154,10 +153,9 @@ def main() -> None:
     # just tie-breaks. Heavier (7B), so gated behind its own flag and fail-open.
     rerank_res = None
     if _rerank_shadow_enabled() and _rerank_sampled(job.get('session_id')):
-        os.environ['KB_RETRIEVAL'] = 'rerank'
         os.environ['KB_RERANK_ALWAYS'] = '1'
         try:
-            rerank_res = mi.retrieve(job['prompt'], project=job.get('project'))
+            rerank_res = MemoryRetriever(mode='rerank').retrieve(job['prompt'], project=job.get('project'))
         except Exception as e:
             _diag(f'rerank pass raised (non-fatal): {e}')
             rerank_res = None

@@ -118,9 +118,11 @@ Rules of thumb:
 of Ollama, with automatic fallback to your local model on quota/auth/network
 errors. Model specs look like `claude:sonnet`, `claude:opus`, or
 `ollama:<tag>`; a bare tag means Ollama. Requirements: the `claude` binary on
-PATH and a `CLAUDE_CODE_OAUTH_TOKEN` in `.env` (create one with
-`claude setup-token`). If either is missing, the wrapper degrades to
-local-only and says so. Override the nightly specs with `KB_SUMMARY_SPEC` /
+PATH and a working subscription login. The wrapper probes a short cloud call
+before selecting cloud backends, so authentication or entitlement failures produce
+one diagnostic and local fallback. An ambient CLI login works; an optional
+`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` overrides that login, so remove
+stale tokens from `.env`. Override nightly specs with `KB_SUMMARY_SPEC` /
 `KB_TOPIC_SPEC`.
 
 ## Nightly runs
@@ -135,7 +137,7 @@ configured) syncs with a second machine and sends a Telegram notice.
 
 Optional `.env` keys:
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — one consolidated notice per run
-- `CLAUDE_CODE_OAUTH_TOKEN` — enables the cloud backends
+- `CLAUDE_CODE_OAUTH_TOKEN` — optional subscription token override; ambient CLI login also works
 - `KB_REMOTE_HOST` + `KB_REMOTE_DATA_DIR` (+ `KB_REMOTE_USER`) — rsync-over-SSH
   sync with another machine (inbox pull + cache publish). Unset = fully local.
 - `KB_DASHBOARD_DIR` — sync against a local data dir instead (e.g. when the
@@ -166,6 +168,30 @@ loop with per-layer verification commands. Retrieval quality is measurable
 with the eval harness: copy `evals/cases.example.jsonl` to `evals/cases.jsonl`,
 replace the synthetic cases with real ones from your own KB, and run
 `python evals/run_eval.py run`.
+
+### Optional agent integration
+
+`scripts/codex_memory_mcp.py` is a local stdio MCP server exposing `recall_memory`.
+Configure your client to launch it with Python and an absolute script path.
+Calls accept `query`, optional `project`, and `max_facts` (1–8). Omit `project` to
+return global notes only. It reads your local index and does not build it.
+
+`config/codex-hooks.json.example` provides opt-in prompt and session-end hook
+commands for clients supporting those events. Merge the template into your client
+configuration; the repository does not activate hooks automatically. Both hooks
+resolve scripts relative to the current Git repository, so the template is for
+sessions launched from this S10 checkout. The shared transcript reader supports
+Claude Code message records and Codex rollout message records.
+
+### Reviewing retrieval cases
+
+Use `scripts/eval_foldin.py mine --batch-size 20` to prepare a checklist, then
+review relevance against your KB. Mining prioritizes positive proposals and skips
+synthetic turns. Supply previous decision files with `--review-history PATH` to
+avoid reviewing the same source events again. Import assistant-reviewed labels
+with `fold --reviewed PATH`; reviewer, reasoning and operator attestation are
+preserved, and additions are limited to train/validation. See
+[the workflow and scorecard reference](docs/feedback-loop.md).
 
 ## What is NOT tracked (by design)
 

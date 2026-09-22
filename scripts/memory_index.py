@@ -144,10 +144,11 @@ def _deep_merge(base: dict, over: dict) -> dict:
     return merged
 
 
-def load_tuning() -> dict:
+def load_tuning(path: Path | None = None) -> dict:
     """Tuning knobs merged over DEFAULT_TUNING. Fail-open: any error -> defaults."""
+    path = TUNING_PATH if path is None else path
     try:
-        return _deep_merge(DEFAULT_TUNING, _parse_tuning_yaml(read_text(TUNING_PATH)))
+        return _deep_merge(DEFAULT_TUNING, _parse_tuning_yaml(read_text(path)))
     except Exception:
         return _deep_merge(DEFAULT_TUNING, {})
 
@@ -329,10 +330,11 @@ def build_index() -> dict:
     return {'topics_indexed': len(entries), 'index_path': str(INDEX_PATH.relative_to(BASE_DIR))}
 
 
-def load_index() -> dict:
-    if not INDEX_PATH.exists():
+def load_index(path: Path | None = None) -> dict:
+    path = INDEX_PATH if path is None else path
+    if not path.exists():
         return {'entries': []}
-    return json.loads(read_text(INDEX_PATH))
+    return json.loads(read_text(path))
 
 
 # ---------- scoring + retrieval ------------------------------------------------
@@ -548,29 +550,36 @@ def _rerank_tiers(query: str, scored: list, tuning: dict) -> tuple[list, bool]:
 
 
 def retrieve(query: str, project: str | None = None, max_facts: int = 6,
-             tuning: dict | None = None, limit: int = 50) -> dict:
+             tuning: dict | None = None, limit: int = 50, *,
+             index_path: Path | None = None, tuning_path: Path | None = None,
+             embedding_path: Path | None = None, mode: str | None = None) -> dict:
     """Return tiered matches. Caller (hook) decides inject vs advertise vs silent.
 
     Project filter: keep entries that are global (no project) OR match the
     session project. Cross-project facts are excluded — both noise and a
     correctness risk (clients differ).
 
-    Scorer is selected by KB_RETRIEVAL (lexical|embedding|hybrid). embedding and
+    New callers use memory_retrieval.MemoryRetriever, the stable R interface.
+    Explicit paths/mode isolate a retrieval instance without changing globals.
+    Omitted paths retain the live files; omitted mode reads KB_RETRIEVAL.
+
+    Scorer is selected by KB_RETRIEVAL (lexical|embedding|hybrid|rerank). embedding and
     hybrid need the topic-embedding cache (built offline); if it is missing or
     the embed call fails, this falls back to lexical so retrieval never breaks."""
     if tuning is None:
-        tuning = load_tuning()
-    index = load_index()
+        tuning = load_tuning() if tuning_path is None else load_tuning(tuning_path)
+    index = load_index() if index_path is None else load_index(index_path)
     qtokens = tokenize(query)
     proj_norm = (project or '').strip().lower()
 
-    mode = retrieval_mode()
+    mode = retrieval_mode() if mode is None else mode
     er = qvec = None
     topic_vecs: dict = {}
     if mode in ('embedding', 'hybrid', 'rerank'):
         try:
             import embedding_rescorer as er  # noqa: PLC0415 (lazy: hook stays lexical-only)
-            topic_vecs = er.load_topic_vectors()
+            topic_vecs = (er.load_topic_vectors() if embedding_path is None
+                          else er.load_topic_vectors(embedding_path))
             if not topic_vecs:
                 mode = 'lexical'             # no cache -> fail safe
             else:
@@ -698,7 +707,8 @@ def main() -> None:
     if args.cmd == 'build':
         print(json.dumps(build_index(), indent=2))
     elif args.cmd == 'query':
-        res = retrieve(args.text, project=args.project)
+        from memory_retrieval import retrieve as recall
+        res = recall(args.text, project=args.project)
         if args.json:
             print(json.dumps(res, indent=2))
             return
